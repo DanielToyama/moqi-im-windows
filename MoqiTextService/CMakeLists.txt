@@ -18,6 +18,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_subdirectory(SogouSkin)
+
 add_library(MoqiTextService SHARED
     ${MOQI_PROTO_CPP}
     # core IME implementation
@@ -32,6 +34,10 @@ add_library(MoqiTextService SHARED
     MoqiClient.h
     MoqiLangBarButton.cpp
     MoqiLangBarButton.h
+    KeyRepeatAccelerator.cpp
+    KeyRepeatAccelerator.h
+    SogouSymbols.cpp
+    SogouSymbols.h
     DllEntry.cpp
     # resources
     ${CMAKE_CURRENT_BINARY_DIR}/MoqiTextService.rc
@@ -42,6 +48,7 @@ add_dependencies(MoqiTextService moqi_proto_cpp_gen)
 
 target_link_libraries(MoqiTextService
     libIME2_static
+    MoqiSogouSkin
     ${MOQI_PROTOBUF_TARGET}
     jsoncpp_lib_static
 )

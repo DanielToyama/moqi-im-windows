@@ -56,3 +56,5 @@ build64-*
 cmake-build-ninja
 
 installer/stage
+artifacts
+dist

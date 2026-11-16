@@ -1,0 +1,158 @@
+diff --git a/src/TextService.cpp b/src/TextService.cpp
+index 8fd2716..455eba4 100644
+--- a/src/TextService.cpp
++++ b/src/TextService.cpp
+@@ -185,6 +185,49 @@ bool getTextExtRect(ITfContext* context, TfEditCookie editCookie, ITfRange* rang
+     return true;
+ }
+ 
++// Place a zero-length caret at the end of `range` using a fresh cloned range.
++// Mutating the current selection range with ShiftEndToRange() leaves the start
++// anchor untouched in some XAML/UWP hosts (Windows Search, Task Manager), which
++// shows the just-committed text as a blue selection. A cloned, collapsed range
++// is unambiguous and gives exactly one caret position.
++bool setCaretAtRangeEnd(ITfContext* context, TfEditCookie editCookie, ITfRange* range,
++                        const wchar_t* tag) {
++    if (!context || !range) {
++        return false;
++    }
++    ComPtr<ITfRange> caretRange;
++    if (range->Clone(&caretRange) != S_OK || !caretRange) {
++        logTextServiceDebug(std::wstring(L"[") + tag + L"] clone range failed");
++        return false;
++    }
++    if (caretRange->Collapse(editCookie, TF_ANCHOR_END) != S_OK) {
++        logTextServiceDebug(std::wstring(L"[") + tag + L"] collapse failed");
++        return false;
++    }
++
++    TF_SELECTION selection = {};
++    selection.range = caretRange;
++    selection.style.ase = TF_AE_NONE;
++    selection.style.fInterimChar = FALSE;
++    const HRESULT hr = context->SetSelection(editCookie, 1, &selection);
++    if (FAILED(hr)) {
++        logTextServiceDebug(std::wstring(L"[") + tag + L"] SetSelection failed hr=" +
++                            std::to_wstring(static_cast<long>(hr)));
++        return false;
++    }
++    auto rangeAcp = caretRange.query<ITfRangeACP>();
++    if (rangeAcp) {
++        LONG anchor = 0;
++        LONG length = -1;
++        if (rangeAcp->GetExtent(&anchor, &length) == S_OK) {
++            logTextServiceDebug(std::wstring(L"[") + tag + L"] caret anchor=" +
++                                std::to_wstring(anchor) + L" len=" +
++                                std::to_wstring(length));
++        }
++    }
++    return true;
++}
++
+ bool getForegroundWindowRect(RECT* rect) {
+     if (!rect) {
+         return false;
+@@ -458,7 +501,9 @@ void TextService::endComposition(ITfContext* context) {
+             if (composition_) {
+                 // move current insertion point to end of the composition string
+                 ComPtr<ITfRange> compositionRange;
++                ComPtr<ITfRange> committedRange;
+                 if (composition_->GetRange(&compositionRange) == S_OK) {
++                    compositionRange->Clone(&committedRange);
+                     if (dummyCompositionActive_) {
+                         logTextServiceDebug(L"[endComposition] clearing dummy anchor");
+                         compositionRange->SetText(cookie, 0, L"", 0);
+@@ -468,20 +513,42 @@ void TextService::endComposition(ITfContext* context) {
+                     // clear display attribute for the composition range
+                     ComPtr<ITfProperty> dispAttrProp;
+                     if (context->GetProperty(GUID_PROP_ATTRIBUTE, &dispAttrProp) == S_OK) {
+-                        dispAttrProp->Clear(cookie, compositionRange);
++                        const HRESULT clearHr =
++                            dispAttrProp->Clear(cookie, compositionRange);
++                        logTextServiceDebug(
++                            L"[endComposition] clear input attribute hr=" +
++                            std::to_wstring(static_cast<long>(clearHr)) +
++                            L" dummy_anchor=" + boolText(dummyCompositionActive_));
+                     }
+ 
+-                    TF_SELECTION selection;
+-                    ULONG selectionNum;
+-                    if (context->GetSelection(cookie, TF_DEFAULT_SELECTION, 1, &selection, &selectionNum) == S_OK) {
+-                        selection.range->ShiftEndToRange(cookie, compositionRange, TF_ANCHOR_END);
+-                        selection.range->Collapse(cookie, TF_ANCHOR_END);
+-                        context->SetSelection(cookie, 1, &selection);
+-                        selection.range->Release();
++                    if (!setCaretAtRangeEnd(context, cookie, compositionRange,
++                                            L"endComposition")) {
++                        TF_SELECTION selection;
++                        ULONG selectionNum;
++                        if (context->GetSelection(cookie, TF_DEFAULT_SELECTION, 1,
++                                                  &selection, &selectionNum) == S_OK) {
++                            selection.range->ShiftEndToRange(cookie, compositionRange,
++                                                             TF_ANCHOR_END);
++                            selection.range->Collapse(cookie, TF_ANCHOR_END);
++                            context->SetSelection(cookie, 1, &selection);
++                            selection.range->Release();
++                        }
+                     }
+                 }
+                 // end composition and clean up
+                 composition_->EndComposition(cookie);
++                // Some XAML hosts keep the input display attribute attached to
++                // the committed range even after composition ends.  Clear the
++                // already-cloned range once more; failure is harmless.
++                if (committedRange) {
++                    ComPtr<ITfProperty> attrAfter;
++                    if (context->GetProperty(GUID_PROP_ATTRIBUTE, &attrAfter) == S_OK) {
++                        const HRESULT clearHr = attrAfter->Clear(cookie, committedRange);
++                        logTextServiceDebug(
++                            L"[endComposition] post-clear input attribute hr=" +
++                            std::to_wstring(static_cast<long>(clearHr)));
++                    }
++                }
+                 // do some cleanup in the derived class here
+                 onCompositionTerminated(false);
+                 composition_ = nullptr;
+@@ -547,18 +614,36 @@ void TextService::setCompositionString(EditSession* session, const wchar_t* str,
+ 
+                     // move the insertion point to end of the composition string
+                     if (!preserveDummyAnchor) {
+-                        selection.range->Collapse(editCookie, TF_ANCHOR_END);
+-                        context->SetSelection(editCookie, 1, &selection);
++                        if (!setCaretAtRangeEnd(context, editCookie, compositionRange,
++                                                L"setCompositionString")) {
++                            selection.range->Collapse(editCookie, TF_ANCHOR_END);
++                            context->SetSelection(editCookie, 1, &selection);
++                        }
+                     }
+                 }
+ 
+                 // set display attribute to the composition range
+                 ComPtr<ITfProperty> dispAttrProp;
+                 if(context->GetProperty(GUID_PROP_ATTRIBUTE, &dispAttrProp) == S_OK) {
+-                    VARIANT val;
+-                    val.vt = VT_I4;
+-                    val.lVal = module_->inputAttrib()->atom();
+-                    dispAttrProp->SetValue(editCookie, compositionRange, &val);
++                    if (inlinePreeditEnabledForComposition()) {
++                        VARIANT val;
++                        val.vt = VT_I4;
++                        val.lVal = module_->inputAttrib()->atom();
++                        dispAttrProp->SetValue(editCookie, compositionRange, &val);
++                    } else {
++                        // External-preedit mode (Sogou skin): the composition
++                        // string is intentionally empty, so TF_ATTR_INPUT only
++                        // decorates the hidden dummy anchor.  In XAML/UWP hosts
++                        // (Windows Search, Task Manager) that attribute can
++                        // survive onto the committed text and render as a blue
++                        // block.  Never apply it in this mode; clear any stale
++                        // value left by a previous composition.
++                        const HRESULT clearHr =
++                            dispAttrProp->Clear(editCookie, compositionRange);
++                        logTextServiceDebug(
++                            L"[setCompositionString] external preedit: cleared input attribute hr=" +
++                            std::to_wstring(static_cast<long>(clearHr)));
++                    }
+                 }
+             }
+             selection.range->Release();

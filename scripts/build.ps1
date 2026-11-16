@@ -119,6 +119,11 @@ $scriptRepoRoot = Join-Path $PSScriptRoot ".."
 if (-not $RepoRoot) { $RepoRoot = $scriptRepoRoot }
 $RepoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
 
+$applyLibimePatch = Join-Path $PSScriptRoot "apply-libime2-patch.ps1"
+if (Test-Path -LiteralPath $applyLibimePatch) {
+  & $applyLibimePatch -RepoRoot $RepoRoot
+}
+
 if (-not $Win32BuildDir) { $Win32BuildDir = Join-Path $RepoRoot "build-vs32" }
 if (-not $X64BuildDir) { $X64BuildDir = Join-Path $RepoRoot "build-vs64" }
 $Win32BuildDir = [System.IO.Path]::GetFullPath($Win32BuildDir)

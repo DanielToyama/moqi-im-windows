@@ -1,0 +1,227 @@
+name: Release patched DLLs
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "dll-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (empty -> dll-<run_number>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dll-${{ github.event_name }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PROTOBUF_VERSION: "33.5"
+
+jobs:
+  build-and-release:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release_tag
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            if ("${{ github.event_name }}" -eq "push") {
+              $tag = "${{ github.ref_name }}"
+            } else {
+              $tag = "dll-${{ github.run_number }}"
+            }
+          }
+          if ($tag -notmatch '^[A-Za-z0-9._-]+$') {
+            throw "Invalid release tag: $tag"
+          }
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "RELEASE_TAG=$tag`n", $utf8NoBom)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "RELEASE_TAG=$tag`n", $utf8NoBom)
+          Write-Host "Release tag: $tag"
+
+      - name: Apply libIME2 patch
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apply-libime2-patch.ps1
+
+      - name: Download protoc
+        run: |
+          $protocRoot = Join-Path $env:RUNNER_TEMP "protoc-$env:PROTOBUF_VERSION-win64"
+          $zipPath = Join-Path $env:RUNNER_TEMP "protoc-$env:PROTOBUF_VERSION-win64.zip"
+
+          if (Test-Path -LiteralPath $protocRoot) {
+            Remove-Item -LiteralPath $protocRoot -Recurse -Force
+          }
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOBUF_VERSION/protoc-$env:PROTOBUF_VERSION-win64.zip" `
+            -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $protocRoot -Force
+          "PROTOBUF_ROOT=$protocRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure x64
+        run: |
+          cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64 "-DMOQI_PROTOBUF_ROOT=$env:PROTOBUF_ROOT"
+
+      - name: Build x64
+        run: |
+          cmake --build build-x64 --config Release --target MoqiTextService SogouLogicTest --parallel 8
+
+      - name: Configure x86
+        run: |
+          cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32 "-DMOQI_PROTOBUF_ROOT=$env:PROTOBUF_ROOT"
+
+      - name: Build x86
+        run: |
+          cmake --build build-x86 --config Release --target MoqiTextService SogouSkinSettings SogouLogicTest --parallel 8
+
+      - name: Run logic tests
+        run: |
+          & .\build-x64\SogouSkinTools\Release\SogouLogicTest.exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "x64 SogouLogicTest failed with exit code $LASTEXITCODE"
+          }
+          & .\build-x86\SogouSkinTools\Release\SogouLogicTest.exe
+          if ($LASTEXITCODE -ne 0) {
+            throw "x86 SogouLogicTest failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Collect DLLs and write release notes
+        run: |
+          $tag = $env:RELEASE_TAG
+          $dist = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          $programFilesX86 = Join-Path $dist "MoqiTextService-ProgramFiles-x86.dll"
+          $programFilesX64 = Join-Path $dist "MoqiTextService-ProgramFiles-x64.dll"
+          $system32Dll = Join-Path $dist "MoqiTextService-System32.dll"
+          $syswow64Dll = Join-Path $dist "MoqiTextService-SysWOW64.dll"
+          $settings = Join-Path $dist "SogouSkinSettings.exe"
+          $installPs1 = Join-Path $dist "install.ps1"
+          $installBat = Join-Path $dist "install.bat"
+
+          Copy-Item ".\build-x86\MoqiTextService\Release\MoqiTextService.dll" $programFilesX86 -Force
+          Copy-Item ".\build-x64\MoqiTextService\Release\MoqiTextService.dll" $programFilesX64 -Force
+          Copy-Item ".\build-x64\MoqiTextService\Release\MoqiTextService.dll" $system32Dll -Force
+          Copy-Item ".\build-x86\MoqiTextService\Release\MoqiTextService.dll" $syswow64Dll -Force
+          Copy-Item ".\build-x86\SogouSkinTools\Release\SogouSkinSettings.exe" $settings -Force
+          Copy-Item ".\SogouSkinTools\install-release.ps1" $installPs1 -Force
+          Copy-Item ".\SogouSkinTools\install-release.bat" $installBat -Force
+
+          $hashLines = @()
+          foreach ($file in @($programFilesX86, $programFilesX64, $system32Dll, $syswow64Dll, $settings)) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+            $hashLines += "$hash  $(Split-Path $file -Leaf)"
+          }
+
+          $install = @"
+          Moqi 搜狗皮肤增强版 DLL
+          版本: $tag
+          提交: $env:GITHUB_SHA
+
+          安装方法:
+          1. 把本文件夹里的 4 个 DLL、SogouSkinSettings.exe、install.bat、install.ps1 放在同一个文件夹。
+          2. 双击 install.bat，按提示同意管理员权限。
+          3. 安装完成后，重新打开正在使用输入法的应用。
+
+          文件对应位置:
+          MoqiTextService-ProgramFiles-x86.dll -> C:\Program Files (x86)\MoqiIM\MoqiTextService.dll
+          MoqiTextService-ProgramFiles-x64.dll -> C:\Program Files (x86)\MoqiIM\x64\MoqiTextService.dll
+          MoqiTextService-System32.dll          -> C:\Windows\System32\MoqiTextService.dll
+          MoqiTextService-SysWOW64.dll          -> C:\Windows\SysWOW64\MoqiTextService.dll
+          SogouSkinSettings.exe                 -> C:\Program Files (x86)\MoqiIM\SogouSkinSettings.exe
+
+          SHA256:
+          $($hashLines -join "`r`n")
+          "@
+          Set-Content -LiteralPath (Join-Path $dist "INSTALL.txt") -Value $install -Encoding utf8
+
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          @"
+          ## 自动构建的搜狗皮肤 DLL
+
+          - 版本：``$tag``
+          - 提交：``$($env:GITHUB_SHA)``
+          - 构建：GitHub Actions / windows-2022
+
+          ### 下载后怎么装
+
+          1. 把本 Release 里的 **4 个 DLL**、``SogouSkinSettings.exe``、``install.bat``、``install.ps1`` 下载到**同一个文件夹**。
+          2. 双击 ``install.bat``，同意 UAC 管理员权限；脚本会自动备份原文件并覆盖四个 DLL 位置。
+          3. 安装完成后重新打开浏览器、微信、编辑器等正在使用输入法的应用。不需要重启系统。
+
+          也可以直接下载 ``moqi-sogou-skin-dlls-$tag.zip``，解压后双击其中的 ``install.bat``。
+
+          ### 文件
+
+          - ``MoqiTextService-ProgramFiles-x86.dll``
+          - ``MoqiTextService-ProgramFiles-x64.dll``
+          - ``MoqiTextService-System32.dll``
+          - ``MoqiTextService-SysWOW64.dll``
+          - ``SogouSkinSettings.exe``
+          - ``install.bat`` / ``install.ps1``
+          - ``moqi-sogou-skin-dlls-$tag.zip``（含全部文件和 SHA256）
+
+          详细说明见仓库 README 的「快速开始」。
+          "@ | Set-Content -LiteralPath $notesPath -Encoding utf8
+
+          $zip = Join-Path $PWD "moqi-sogou-skin-dlls-$tag.zip"
+          Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip -Force
+          "RELEASE_NOTES=$notesPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moqi-sogou-skin-dlls-${{ steps.release_tag.outputs.RELEASE_TAG }}
+          path: |
+            dist\*
+            moqi-sogou-skin-dlls-${{ steps.release_tag.outputs.RELEASE_TAG }}.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $assets = @(
+            (Join-Path $PWD "dist\MoqiTextService-ProgramFiles-x86.dll"),
+            (Join-Path $PWD "dist\MoqiTextService-ProgramFiles-x64.dll"),
+            (Join-Path $PWD "dist\MoqiTextService-System32.dll"),
+            (Join-Path $PWD "dist\MoqiTextService-SysWOW64.dll"),
+            (Join-Path $PWD "dist\SogouSkinSettings.exe"),
+            (Join-Path $PWD "dist\install.bat"),
+            (Join-Path $PWD "dist\install.ps1"),
+            (Join-Path $PWD "moqi-sogou-skin-dlls-$tag.zip")
+          )
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+            gh release edit $tag --title "Moqi 搜狗皮肤 DLL $tag" --notes-file $env:RELEASE_NOTES
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+          } else {
+            git rev-parse -q --verify "refs/tags/$tag" *> $null
+            if ($LASTEXITCODE -eq 0) {
+              gh release create $tag @assets --title "Moqi 搜狗皮肤 DLL $tag" --notes-file $env:RELEASE_NOTES
+            } else {
+              gh release create $tag @assets --title "Moqi 搜狗皮肤 DLL $tag" --notes-file $env:RELEASE_NOTES --target $env:GITHUB_SHA
+            }
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }

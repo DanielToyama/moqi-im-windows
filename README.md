@@ -1,182 +1,237 @@
-# 墨奇输入法 Windows版
+# 墨奇输入法 Windows 版（搜狗皮肤增强版）
 
-墨染清风书雅韵，奇思逸趣入诗文。
+这是 [`DanielToyama/moqi-im-windows`](https://github.com/DanielToyama/moqi-im-windows) 的搜狗皮肤增强分支，fork 自 [`gaboolic/moqi-im-windows`](https://github.com/gaboolic/moqi-im-windows)。
 
-Windows 端的输入法前端，负责把 `moqi-ime` 后端接入 **Microsoft Text Services Framework (TSF)**，并提供候选窗、语言栏按钮、组合串上屏等 Windows 平台能力。
+本分支只修改 Windows 前端外观和输入体验：搜狗 `.ssf` / `skin.ini` 皮肤、候选窗、常驻状态栏、原生皮肤设置界面、字体/字号/颜色、状态栏按钮、长按连发、u 模式 preedit 等。不修改 `moqi-ime` 后端、协议和候选/上屏核心流程，后续可以继续合并上游更新。
 
-当前状态：已实现 **[Rime / 中州韵](https://github.com/rime/librime)** 输入法接入，**fcitx5** 输入法接入中。
+## 快速开始（部署与使用教程）
 
-项目 TSF 层核心依赖：[`libIME2`](https://github.com/EasyIME/libIME2)。很大程度上参考了[PIME](https://github.com/EasyIME/PIME) 以及 [小狼毫](https://github.com/rime/weasel) 项目。
+普通用户不需要编译，直接下载 Release 里的 DLL 覆盖即可。
 
-核心引擎：[`moqi-ime`](https://github.com/gaboolic/moqi-ime)。使用Go语言实现。
+### 1. 下载 Release 文件
 
-默认输入法：[`白霜拼音`](https://github.com/gaboolic/rime-frost)。
+打开 [Releases](https://github.com/DanielToyama/moqi-im-windows/releases)，把下面这些文件下载到**同一个文件夹**：
 
-为什么选择白霜拼音？
+| 文件 | 用途 |
+|---|---|
+| `MoqiTextService-ProgramFiles-x86.dll` | 安装目录的 32 位 DLL |
+| `MoqiTextService-ProgramFiles-x64.dll` | 安装目录的 64 位 DLL |
+| `MoqiTextService-System32.dll` | `C:\Windows\System32` 的 64 位 DLL |
+| `MoqiTextService-SysWOW64.dll` | `C:\Windows\SysWOW64` 的 32 位 DLL |
+| `SogouSkinSettings.exe` | 皮肤设置程序 |
+| `install.bat` | 双击运行的安装脚本入口 |
+| `install.ps1` | 安装脚本本体 |
 
-1. 白霜拼音经过评测，词频准确度是最高的，超过了商业输入法。[查看rime各方案评测结果](https://github.com/gaboolic/rime-schema-compare/blob/main/report/latest.md)
-2. 白霜拼音作者也是我，有问题改起来方便。
+也可以直接下载 `moqi-sogou-skin-dlls-<版本>.zip`，解压到任意文件夹，里面已经包含上述文件。
 
-## 快速开始
+> 四个 DLL 缺一不可，而且必须和 `install.bat`、`install.ps1` 放在同一个文件夹里。
 
-下载安装包：[moqi-im-windows-setup.exe](https://github.com/gaboolic/moqi-im-windows/releases)
+### 2. 放到同一个文件夹
+
+例如新建：
+
+```text
+C:\Users\你的用户名\Downloads\moqi-skin-install\
+```
+
+把上面 7 个文件全部拖进去。不要只把 DLL 拖到桌面后单独双击，脚本会找不到同目录的安装文件。
+
+### 3. 双击 `install.bat`
+
+1. 双击 `install.bat`。
+2. Windows 弹出 UAC 时点“是”。
+3. 脚本会自动：
+   - 停止 `MoqiLauncher.exe`；
+   - 把原文件备份到 `C:\Program Files (x86)\MoqiIM\sogou-skin-backup-<时间戳>\`；
+   - 把四个 DLL 分别复制到四个 TSF 实际加载位置；
+   - 安装 `SogouSkinSettings.exe`；
+   - 重新启动 `MoqiLauncher.exe`。
+4. 看到“安装完成”后按回车退出。
+
+对应关系如下：
+
+| Release 文件 | 复制到 |
+|---|---|
+| `MoqiTextService-ProgramFiles-x86.dll` | `C:\Program Files (x86)\MoqiIM\MoqiTextService.dll` |
+| `MoqiTextService-ProgramFiles-x64.dll` | `C:\Program Files (x86)\MoqiIM\x64\MoqiTextService.dll` |
+| `MoqiTextService-System32.dll` | `C:\Windows\System32\MoqiTextService.dll` |
+| `MoqiTextService-SysWOW64.dll` | `C:\Windows\SysWOW64\MoqiTextService.dll` |
+
+安装完成后，关闭并重新打开正在使用输入法的应用（浏览器、微信、VS Code、记事本等）。**不需要重启系统。**
+如果某个应用还是旧外观，通常是因为它还在用安装前加载的旧 DLL，重开该应用即可。
+
+### 4. 选择搜狗皮肤
+
+打开：
+
+```text
+C:\Program Files (x86)\MoqiIM\SogouSkinSettings.exe
+```
+
+在“皮肤”下拉框选择 `.ssf`（会列出最近使用、下载目录、桌面和搜狗皮肤编辑器目录，也可以点“浏览...”），点“应用”。正在运行的输入法会立即重载，不需要重启应用。
+
+设置界面还可以调整：
+
+- 字号 8–72，整套候选窗按比例缩放；
+- 中文/英文字体；
+- 拼音、首选、候选、注释四组颜色；
+- 状态栏按钮显示/隐藏；
+- 候选横排/竖排。
+
+### 5. 回滚
+
+如果安装后不满意，关闭 `MoqiLauncher` 和相关应用，把
+`C:\Program Files (x86)\MoqiIM\sogou-skin-backup-<时间戳>\` 里的文件按原路径复制回去即可。
+也可以重新运行官方墨奇安装包选择“修复/卸载”。
 
 ## 特色功能
 
-- 托盘切换输入法状态：中英文 全半角 简繁
-- 外观编辑：主题皮肤切换、字体调整、主题色切换、自定义快捷键。一般功能都可通过托盘图标右键修改，强烈自定义修改需求可修改C:\Users\用户名\AppData\Roaming\Moqi\appearance_config.json  现在已支持导入皮肤，可选yaml文件
-- 默认使用白霜拼音，支持切换方案集、切换输入方案、更新配置
-- 修改了librime的组句算法，支持输出多条整句候选，正确率大大提升
-- 置顶短语、超级简拼
-- 输入设置：自动插入成对符号、分号键次选
-- 同步设置：设置WebDAV后，支持跨设备同步用户词库（WebDAV）
-- **云剪贴板（WebDAV）**：与 Android 版互通，默认关闭。在输入法「设置」菜单 →「云剪贴板」中配置 WebDAV 地址与账号；开启后 PC 任意应用复制纯文本会自动上传到 `{墨奇设置目录}/clip/`（默认 `moqi-input-method/clip/`）。按 `Ctrl+0`（可在设置中修改）将云端条目显示为候选列表并上屏。配置保存在 `%APPDATA%\Moqi\cloud_clipboard.json`，密码经 DPAPI 加密存于 `cloud_clipboard.pw`。
-- 原生ai功能：支持整句优化、翻译、问答等，只有想不到没有做不到。编辑C:\Users\用户名\AppData\Roaming\Moqi\Rime\ai_config.json 可以接入ai大模型以及自定义提示词、快捷键。为了方便体验，已在安装包里加了默认配置，可以替换成用户自己的apikey
+### 搜狗皮肤与输入体验
 
-```
-{
-  "api": {
-    "base_url": "",
-    "api_key": "",
-    "model": ""
-  },
-  "actions": [
-    {
-      "name": "写好评",
-      "hotkey": "Ctrl+Shift+G",
-      "prompt": "请围绕“{{candidate_1}}”生成最多 3 条适合直接发布的中文好评，每条 20 字左右。"
-    },
-    {
-      "name": "优化整句",
-      "hotkey": "Ctrl+Shift+O",
-      "prompt": "上一句是：{{previous_commit}}\n原始输入拼音是：{{composition}}\n前三个候选词：\n{{candidates_top3}}\n请严格遵循原始输入拼音来选字，只能在符合这串拼音的候选范围内优化整句，不要凭空改成不匹配拼音的字词。只输出 1 条最通顺、最自然的整句候选，不要解释。"
-    },
-    {
-      "name": "中译英",
-      "hotkey": "Ctrl+Shift+E",
-      "prompt": "请把当前中文内容翻译成自然、地道的英文。 “{{candidate_1}}” 只输出 1 条英文翻译，不要解释。"
-    },
-    {
-      "name": "问答",
-      "hotkey": "Ctrl+Shift+Q",
-      "prompt": "用户询问： “{{candidate_1}}” 只输出 1 条答案，不要解释。"
-    }
-  ]
-}
-```
+- **搜狗皮肤引擎**：支持 `.ssf` / `skin.ini`，H1/H2 横排、V1/V2 竖排四种方案，9-slice、透明 PNG、锚点、分隔线和皮肤字体。
+- **原生 C++ 设置界面**：皮肤下拉、最近使用、字体、字号、四组颜色、状态栏按钮开关、实时预览。
+- **常驻皮肤状态栏**：同一时刻只显示当前前台应用的一个状态栏；按钮可切换中英文、全半角、中英标点、简繁；右键菜单包含皮肤设置、符号输入、横竖排、显示/隐藏状态栏、重新加载皮肤。
+- **长按连发**：按住普通字母或退格约 420ms 后连续输入，最多 60 个；组合键、方向键、候选数字键不参与。
+- **常见符号工具**：状态栏右键可直接插入标点、数学、货币、特殊符号。
+- **u 模式/拼字模式**：候选窗显示 `u[拼字]`、`u'shui'shang[拼字]`；长输入、空候选、逐字退格时窗口保持可见；回车提交临时英文时去掉前导 `u`。
 
-## 功能演示
+### 上游原有功能
 
-ai功能演示：<https://github.com/gaboolic/moqi-im-windows/issues/4>
-![输入0-ai](others/imgs/input-ai.gif)
-![输入1-ai](others/imgs/input-zise.png)
+- 托盘切换中英文、全半角、简繁；
+- 白霜拼音，支持切换方案集、切换输入方案、更新配置；
+- 多整句候选、置顶短语、超级简拼；
+- 自动插入成对符号、分号键次选；
+- WebDAV 词库同步、云剪贴板、AI 整句/翻译/问答；
+- 外观主题、字体、主题色和快捷键设置。
 
-外观配置、切换方案
-![菜单主题](others/imgs/caidan-zhuti.png)
-![菜单方案集](others/imgs/caidan-schemas.png)
-![菜单方案](others/imgs/caidan-schema.png)
+上游功能的详细说明见 [上游 README](https://github.com/gaboolic/moqi-im-windows)。
 
-同步设置
-![同步设置](others/imgs/caidan-tongbu.png)
-![webdav](others/imgs/caidan-webdav.png)
+## 常见问题
 
-多整句、句中任意辅助码演示
-![输入整句组句](others/imgs/input-zuju.png)
-![输入4-句中辅助码](others/imgs/input-liuxingyusamantianji.gif)
+- **双击 `install.bat` 提示缺少文件**：四个 DLL、`SogouSkinSettings.exe`、`install.bat`、`install.ps1` 必须放在同一个文件夹。
+- **安装时提示文件被占用**：先关闭 `MoqiLauncher.exe`、浏览器、微信、编辑器等正在使用输入法的应用，再运行 `install.bat`。
+- **安装后还是旧皮肤/旧界面**：重开对应应用；Explorer 可重启一次 `explorer.exe`。不需要重启系统。
+- **状态栏不显示或残留旧窗口**：确认皮肤 `[StatusBar]` 有 `pic=...`，并在设置里勾选“显示皮肤状态栏”；本分支同一时刻只保留当前前台应用的一个状态栏。
 
-一些输入效果
-![输入2](others/imgs/input-mo.png)
-![输入3](others/imgs/input-qi.png)
+- **长按连发想关闭**：在 `%APPDATA%\Moqi\sogou_skin_options.ini` 写 `key_repeat=0`。
+- **状态栏按钮不见了**：默认只显示皮肤 `[StatusBar]` 中显式 `_display=1` 的按钮，可在设置界面逐个勾选。
 
-## 运行架构
+## 高级设置
 
-```
-┌─────────────────────────────────────────────┐
-│           Windows 应用程序                 │
-│      (记事本 / Word / 浏览器 / 其他)        │
-├─────────────────────────────────────────────┤
-│  MoqiTextService.dll                        │
-│  - TSF 接口实现                             │
-│  - 按键事件/组合串/候选窗处理               │
-│  - 通过命名管道连接 Launcher                │
-├─────────────────────────────────────────────┤
-│  MoqiLauncher.exe                            │
-│  - 读取 backends.json                       │
-│  - 管理后端进程生命周期                     │
-│  - 在命名管道与后端 stdin/stdout 之间转发消息│
-├─────────────────────────────────────────────┤
-│  moqi-ime\server.exe                        │
-│  - Go 后端进程                              │
-│  - 加载 input_methods\*\ime.json            │
-│  - 返回候选、状态、上屏文本等               │
-└─────────────────────────────────────────────┘
+### 皮肤覆盖文件
+
+`%APPDATA%\Moqi\sogou_skin_overrides.ini` 可以覆盖皮肤字体、字号、颜色和布局字段；
+`%APPDATA%\Moqi\sogou_skin_options.ini` 控制状态栏显示、横竖排、长按连发和状态栏坐标。
+
+### 白霜拼音模糊音
+
+只改用户目录下的 `%APPDATA%\Moqi\Rime\rime_frost.custom.yaml`，用 `speller/algebra/+` 追加规则，例如：
+
+```yaml
+patch:
+  "speller/algebra/+":
+    - derive/^([zcs])h/$1/
+    - derive/^([zcs])([^h])/$1h$2/
+    - derive/ang$/an/
+    - derive/an$/ang/
+    - derive/eng$/en/
+    - derive/en$/eng/
+    - derive/ing$/in/
+    - derive/in$/ing/
 ```
 
-当前默认部署中，`backends.json` 指向 `moqi-ime\server.exe`；Windows 侧通过本地命名管道连到 `MoqLauncher`，`MoqLauncher` 再把请求按行写入后端的标准输入，并从标准输出读取响应。
+保存后在托盘菜单执行“刷新配置(&R)”。
 
-## 核心职责
+### 导入搜狗词库
 
-- **TSF 文本服务**：实现 `ITfTextInputProcessor`、`ITfKeyEventSink` 等接口
-- **Windows UI**：管理候选窗口、消息窗口、语言栏按钮和 preserved keys
-- **协议转换**：把按键与状态序列化为 JSON 请求，并应用后端返回的组合串、候选和提交文本
-- **后端接入**：通过 `MoqLauncher` 读取 `backends.json`，按语言配置 GUID 路由到对应后端
+不要把几万条词库塞进 `custom_phrase`。新建独立的
+`%APPDATA%\Moqi\Rime\sogou_user.dict.yaml`，再在 `rime_frost.dict.yaml` 的 `import_tables:` 中加入 `sogou_user`，最后刷新配置。这样可以避免每次按键扫描大表导致卡顿。
 
-## 与 `moqi-ime` 的关系
+## 开发者：从源码构建
 
-本仓库不实现拼音解析、候选生成、词库管理等输入法核心逻辑，这些能力由 `moqi-ime` 提供。
+前置：Visual Studio 2022（桌面 C++ 工作负载）、CMake 3.21+、Windows SDK。部署需要管理员权限，构建不需要。
 
-Windows 侧的职责主要是：
+```powershell
+git clone https://github.com/DanielToyama/moqi-im-windows.git
+cd moqi-im-windows
 
-- 把 TSF 生命周期和按键事件转发给后端
-- 根据后端返回结果更新候选窗、组合串和状态
-- 从已安装后端目录扫描 `input_methods/*/ime.json`，为语言配置提供元数据与配置入口
+# 如果搜狗皮肤改动在独立分支：
+git checkout feature/sogou-skin
 
-因此，`moqi-im-windows` 与 `moqi-ime` 需要配套部署。
+git submodule update --init --recursive
 
-## 技术栈
+# 应用 libIME2 的外部 preedit/蓝底修复补丁（已包含时会自动跳过）
+powershell -ExecutionPolicy Bypass -File .\scripts\apply-libime2-patch.ps1
+```
 
-- **语言**：C++ 、GO
-- **框架**：Microsoft TSF、Win32 API
-- **进程/IO**：命名管道、子进程 `stdin/stdout` 转发、`libuv`
-- **数据格式**：protobuf(见/proto/moqi.proto)
-- **日志**：`spdlog`
-- **构建**：CMake + Visual Studio 2022 / MSBuild
+推荐构建方式：
 
-## 源码布局
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Release
+```
 
-- `MoqiTextService`：TSF 文本服务，产出 `MoqiTextService.dll`
-- `MoqLauncher`：后端启动器与消息转发器，产出 `MoqiLauncher.exe`
-- `libIME2`：IME/TSF 基础库，也是本项目 TSF 层的核心依赖，来源：[`gaboolic/libIME2`](https://github.com/gaboolic/libIME2)
-- `libuv`：Launcher 的事件循环与进程/管道依赖
-- `backends.json`：后端清单，定义后端名称、启动命令和工作目录
-- `scripts`：构建脚本
-- `installer/`：Inno Setup 安装器脚本与输出目录
+产物：
 
-## 构建
+- `build-vs32\MoqiTextService\Release\MoqiTextService.dll`
+- `build-vs64\MoqiTextService\Release\MoqiTextService.dll`
+- `build-vs32\SogouSkinTools\Release\SogouSkinSettings.exe`
+- `build-vs32\SogouSkinTools\Release\SogouLogicTest.exe`
+- `build-vs64\SogouSkinTools\Release\SogouLogicTest.exe`
 
-前置：**Visual Studio 2022**、**CMake 3.21+**、Windows SDK。
+如果直接用 VS 自带 CMake：
 
-在本仓库根目录执行：
+```powershell
+$cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 
-   `powershell -ExecutionPolicy Bypass -File .\scripts\_all_in_package.ps1`
+& $cmake -S . -B build-vs32 -G "Visual Studio 17 2022" -A Win32
+& $cmake --build build-vs32 --config Release --target MoqiTextService SogouSkinSettings SogouLogicTest --parallel 8
 
-该脚本会生成安装器：`installer\dist\moqi-im-windows-setup.exe`
+& $cmake -S . -B build-vs64 -G "Visual Studio 17 2022" -A x64
+& $cmake --build build-vs64 --config Release --target MoqiTextService SogouLogicTest --parallel 8
+```
 
-## 参考文档
+源码构建后的部署可以继续使用脚本（会备份原文件）：
 
-- [Microsoft TSF 文档](https://docs.microsoft.com/en-us/windows/win32/tsf/text-services-framework)
-- [ITfTextInputProcessor 接口](https://docs.microsoft.com/en-us/windows/win32/api/msctf/nn-msctf-itftextinputprocessor)
+```powershell
+powershell -ExecutionPolicy Bypass -File .\SogouSkinTools\deploy-installed.ps1
+```
+
+或者运行 `.\SogouSkinTools\run-deploy.ps1` 自动请求 UAC。
+
+### 自动发布 DLL
+
+仓库自带 `.github/workflows/release-dll.yml`。推送 `v*` 或 `dll-*` tag，或在 Actions 页面手动运行
+`Release patched DLLs`，会自动：
+
+1. 应用 `libIME2` 补丁；
+2. 构建 x64/x86 DLL 和 `SogouSkinSettings.exe`；
+3. 跑 x64/x86 的 `SogouLogicTest`；
+4. 把四个目标 DLL、`install.bat`、`install.ps1`、设置程序和 zip 上传到 GitHub Release。
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+## 上游同步
+
+```powershell
+git remote add upstream https://github.com/gaboolic/moqi-im-windows.git
+git fetch upstream
+git merge upstream/main
+```
+
+如果 `upstream` 已存在，跳过 `git remote add`。合并后重新构建并运行 `SogouLogicTest` /
+`SogouSkinRenderTest`。
+
+搜狗皮肤逻辑集中在 `MoqiTextService/SogouSkin/` 和 `SogouSkinTools/`，上游文件只保留少量挂载点；
+详细模块说明见 [MoqiTextService/SogouSkin/README.md](MoqiTextService/SogouSkin/README.md)。
+
+## 参考
+
+- [Microsoft TSF 文档](https://learn.microsoft.com/windows/win32/tsf/text-services-framework)
 - [PIME](https://github.com/EasyIME/PIME)
 - [小狼毫](https://github.com/rime/weasel)
+- [白霜拼音](https://github.com/gaboolic/rime-frost)
 
-## 友情链接
-
-白霜拼音 <https://github.com/gaboolic/rime-frost>
-
-墨奇音形 <https://github.com/gaboolic/rime-shuangpin-fuzhuma>
-
-墨奇五笔整句 <https://github.com/gaboolic/rime-wubi-sentence>
-
-### Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=gaboolic/moqi-im-windows&type=Date)](https://star-history.com/#gaboolic/moqi-im-windows&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=DanielToyama/moqi-im-windows&type=Date)](https://star-history.com/#DanielToyama/moqi-im-windows&Date)

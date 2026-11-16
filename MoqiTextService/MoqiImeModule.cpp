@@ -188,9 +188,18 @@ bool ImeModule::onConfigure(HWND hwndParent, LANGID langid,
                     configDir.empty() ? NULL : configDir.c_str(),
                     SW_SHOWNORMAL);
   } else {
-    // FIXME: this message should be localized.
-    ::MessageBoxW(hwndParent, L"The input module does not have a config tool.",
-                  NULL, MB_OK);
+    // Moqi has no configTool in ime.json; expose the native Sogou skin
+    // settings here so "设置" on the language bar opens a real C++ UI.
+    const std::wstring settingsExe = programDir_ + L"\\SogouSkinSettings.exe";
+    if (!programDir_.empty() &&
+        ::GetFileAttributesW(settingsExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      ::ShellExecuteW(hwndParent, L"open", settingsExe.c_str(), NULL,
+                      programDir_.c_str(), SW_SHOWNORMAL);
+    } else {
+      // FIXME: this message should be localized.
+      ::MessageBoxW(hwndParent, L"The input module does not have a config tool.",
+                    NULL, MB_OK);
+    }
   }
   return true;
 }

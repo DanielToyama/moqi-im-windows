@@ -7,6 +7,7 @@
 #include <LibIME2/src/ComObject.h>
 #include <LibIME2/src/ImeWindow.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,10 @@ class EditSession;
 }
 
 namespace Moqi {
+namespace SogouSkin {
+class Renderer;
+struct RenderState;
+}
 
 struct CandidateUiItem {
     std::wstring text;
@@ -72,6 +77,11 @@ public:
     void setCommentColor(COLORREF color);
     void setCommentHighlightColor(COLORREF color);
     void syncOwner(Ime::EditSession* session);
+    void reloadSogouSkin();
+    // Batch candidate list/preedit mutations so the expensive layout pass runs
+    // once per response instead of once per setter.
+    void beginUpdate();
+    void endUpdate();
     void recalculateSize() override;
 
 protected:
@@ -94,6 +104,11 @@ private:
     void onMouseWheel(WPARAM wp, LPARAM lp);
     void paintPreeditCursor(HDC hdc, const RECT& preeditRc);
     void applyWindowShape();
+    void loadSogouSkin();
+    void scheduleSogouRender();
+    void updateSogouLayeredWindow(bool force = false);
+    SogouSkin::RenderState buildSogouRenderState() const;
+    bool hasSogouSkin() const;
 
 private:
     BOOL shown_;
@@ -134,6 +149,21 @@ private:
     bool draggingWindow_;
     bool trackingMouse_;
     bool useCursor_;
+    std::unique_ptr<SogouSkin::Renderer> sogouRenderer_;
+    bool sogouLayered_ = false;
+    bool sogouRenderDirty_ = false;
+    bool sogouEverRendered_ = false;
+    UINT_PTR sogouRenderTimer_ = 0;
+    ULONGLONG sogouLastRenderTick_ = 0;
+    ITfContext* ownerContext_ = nullptr;
+    HWND cachedRawOwner_ = nullptr;
+    HWND cachedOwner_ = nullptr;
+    HWND cachedOwnerForeground_ = nullptr;
+    ULONGLONG ownerResolvedTick_ = 0;
+    int updateBatchDepth_ = 0;
+    bool sizeDirty_ = false;
+    std::vector<RECT> sogouItemRects_;
+    RECT sogouPreeditRect_ = {0, 0, 0, 0};
 };
 
 } // namespace Moqi

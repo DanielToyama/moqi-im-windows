@@ -29,10 +29,18 @@
 #include <sys/types.h>
 #include "MoqiClient.h"
 #include <algorithm>
+#include <map>
 #include <memory>
 
 
 namespace Moqi {
+
+namespace SogouSkin {
+class StatusBarWindow;
+class Theme;
+}
+
+class KeyRepeatAccelerator;
 
 class TextService: public Ime::TextService {
 	friend class Client;
@@ -213,7 +221,7 @@ public:
 	}
 
 	bool effectiveInlinePreedit() const {
-		if (autoInlinePreeditDisabled_) {
+		if (autoInlinePreeditDisabled_ || sogouSkinMode_) {
 			return false;
 		}
 		return effectiveUiLess() || inlinePreedit_;
@@ -285,6 +293,18 @@ public:
 		}
 	}
 
+	void beginCandidateUpdate() {
+		if (candidateWindow_) {
+			candidateWindow_->beginUpdate();
+		}
+	}
+
+	void endCandidateUpdate() {
+		if (candidateWindow_) {
+			candidateWindow_->endUpdate();
+		}
+	}
+
 	bool showingCandidates() {
 		return showingCandidates_;
 	}
@@ -328,6 +348,19 @@ private:
 	int candCommentFontHeight();
 	void applyCandidateAppearanceNow();
 	void refreshCandidateAppearance();
+	void ensureSogouSkinMode();
+	void ensureSogouStatusBar();
+	void setSogouStatusBarVisible(bool visible);
+	void refreshSogouStatusBar();
+	int sogouStatusBarItemState(const std::wstring& itemName) const;
+	void handleSogouStatusBarClick(const std::wstring& itemName);
+	void showSogouStatusBarMenu(POINT screenPoint);
+	void reloadSogouSkinFromFiles();
+	void openSogouSkinSettings();
+	void insertSogouSymbol(const std::wstring& text);
+	void configureKeyRepeat();
+	void stopKeyRepeat();
+	void injectSogouKeyRepeat(WORD vk);
 	void applyUiLessOverrideState();
 	void invalidateCandidateUiCache();
 	bool isCandidateContentApplied(const std::wstring& renderedPreedit) const;
@@ -347,6 +380,24 @@ private:
 	bool autoInlinePreeditDisabled_;
 	bool autoDisableTsfCandidateUi_;
 	Ime::ComPtr<Moqi::CandidateWindow> candidateWindow_; // this is a ref-counted COM object and should not be managed with std::unique_ptr
+	std::unique_ptr<SogouSkin::StatusBarWindow> sogouStatusBar_;
+	std::shared_ptr<SogouSkin::Theme> sogouTheme_;
+	std::map<std::wstring, int> sogouStatusBarLocalStates_;
+	bool sogouSkinMode_ = false;
+	bool sogouSkinChecked_ = false;
+	std::unique_ptr<KeyRepeatAccelerator> keyRepeat_;
+	HWND keyRepeatForeground_ = nullptr;
+	// Set by filterKeyDown when an OS auto-repeat was swallowed because the
+	// accelerator emits its own burst; onKeyDown must then consume that same
+	// key event without forwarding it to the backend.
+	bool suppressRepeatKeyDown_ = false;
+	WORD suppressedRepeatKey_ = 0;
+	// Idle Shift tap fallback: Rime's ascii_composer switches mode while
+	// composing, but a bare Shift tap in an empty buffer can be a no-op.
+	// Track whether Shift was used with another key before deciding to toggle.
+	bool shiftTapCandidate_ = false;
+	bool shiftTapUsed_ = false;
+	ULONGLONG shiftTapStartTick_ = 0;
 	bool showingCandidates_;
 	bool pendingCandidateRecovery_;
 	std::vector<CandidateUiItem> candidates_; // current candidate list

@@ -32,6 +32,7 @@
 #include <vector>
 #include <json/json.h>
 #include "proto/moqi.pb.h"
+#include "CompositionDisplay.h"
 
 namespace Moqi {
 
@@ -71,6 +72,7 @@ public:
 	bool changePage(bool backward);
 
 	bool onCommand(UINT id, Ime::TextService::CommandType type);
+	LangBarButton* findButton(const std::string& id);
 
 	// called when a language bar button needs a menu
 	bool onMenu(LangBarButton* btn, ITfMenu* pMenu);
@@ -121,6 +123,14 @@ private:
     bool sendOnMenu(std::string button_id, Json::Value& result);
 
     bool handleRpcResponse(Json::Value& msg, Ime::EditSession* session = nullptr);
+    // Apply only the state that is meaningful for filterKeyDown/filterKeyUp
+    // responses.  Rime's filter calls report the consumed-key flag but leave
+    // composition/candidate fields empty; the real state arrives with
+    // onKeyDown/onKeyUp (which have an edit session).  Keep filter responses
+    // from feeding empty state into the tracker/updateStatus.
+    bool handleFilterRpcResponse(Json::Value& msg);
+    bool updateUModeTracker(Json::Value& msg, Ime::KeyEvent& keyEvent,
+                            bool idleBeforeKey);
 
     // Update text service and UI status based on RPC responses.
     void updateSelectionKeys(Json::Value& msg);
@@ -153,6 +163,8 @@ private:
 	bool asyncFlushInProgress_;
 	std::deque<Json::Value> pendingAsyncResponses_;
 	std::vector<AutoPairRuleState> autoPairRules_;
+	UModeInputTracker uModeTracker_;
+	std::wstring uModeCommitRaw_;
 };
 
 }

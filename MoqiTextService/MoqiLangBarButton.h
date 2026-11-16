@@ -40,6 +40,10 @@ public:
 		return id_;
 	}
 
+	const std::wstring& iconFile() const {
+		return iconFile_;
+	}
+
     void setIconFile(std::wstring filePath);
 
 	static void clearIconCache();

@@ -4,6 +4,7 @@
 
 #include "MoqiCandidateWindow.h"
 #include "MoqiTextService.h"
+#include "SogouSkin/SogouSkin.h"
 
 #include <LibIME2/src/DebugLogConfig.h>
 #include <LibIME2/src/DebugLogFile.h>
@@ -26,6 +27,8 @@ constexpr COLORREF kItemText = RGB(0, 0, 0);
 constexpr COLORREF kSelectedBackground = RGB(198, 221, 249);
 constexpr COLORREF kSelectedText = RGB(0, 0, 0);
 constexpr int kDefaultCandidateSpacing = 20;
+constexpr UINT_PTR kSogouRenderTimerId = 0x4D52;
+constexpr ULONGLONG kSogouRenderThrottleMs = 16;
 
 std::wstring currentProcessPath() {
     std::wstring buffer(MAX_PATH, L'\0');
@@ -71,6 +74,22 @@ std::wstring formatCandidateWindowLogLine(const std::wstring& message) {
     return line.str();
 }
 
+
+void appendSogouSkinLog(const std::wstring& message) {
+    const wchar_t* localAppData = _wgetenv(L"LOCALAPPDATA");
+    if (!localAppData || !*localAppData) {
+        return;
+    }
+    const std::wstring logDir = std::wstring(localAppData) + L"\\MoqiIM\\Log";
+    ::CreateDirectoryW(logDir.c_str(), nullptr);
+    const std::wstring logPath = logDir + L"\\sogou-skin.log";
+    std::wofstream stream(logPath, std::ios::app);
+    if (!stream.is_open()) {
+        return;
+    }
+    stream << L"[pid=" << ::GetCurrentProcessId() << L"] " << message << std::endl;
+}
+
 void appendCandidateWindowLog(const std::wstring& message) {
     if (!Ime::isTraceLoggingEnabled()) {
         return;
@@ -101,7 +120,71 @@ std::wstring hwndToString(HWND hwnd) {
     return stream.str();
 }
 
+std::wstring integrityText(bool available, DWORD rid) {
+    return available ? std::to_wstring(rid) : std::wstring(L"<unavailable>");
+}
+
+ULONGLONG qpcMicros() {
+    static LARGE_INTEGER frequency = [] {
+        LARGE_INTEGER value{};
+        ::QueryPerformanceFrequency(&value);
+        return value;
+    }();
+    LARGE_INTEGER counter{};
+    ::QueryPerformanceCounter(&counter);
+    if (frequency.QuadPart <= 0) {
+        return 0;
+    }
+    return static_cast<ULONGLONG>(
+        (counter.QuadPart * 1000000ULL) / frequency.QuadPart);
+}
+
+bool processIntegrityRid(HANDLE process, DWORD* rid) {
+    if (!process || !rid) {
+        return false;
+    }
+
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        return false;
+    }
+
+    DWORD length = 0;
+    ::GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &length);
+    if (length == 0) {
+        ::CloseHandle(token);
+        return false;
+    }
+
+    std::vector<BYTE> buffer(length);
+    const BOOL ok = ::GetTokenInformation(
+        token, TokenIntegrityLevel, buffer.data(), length, &length);
+    ::CloseHandle(token);
+    if (!ok) {
+        return false;
+    }
+
+    auto* label = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer.data());
+    if (!label->Label.Sid) {
+        return false;
+    }
+    const PUCHAR subAuthorityCount = ::GetSidSubAuthorityCount(label->Label.Sid);
+    if (!subAuthorityCount || *subAuthorityCount == 0) {
+        return false;
+    }
+    const DWORD* subAuthority = ::GetSidSubAuthority(
+        label->Label.Sid, static_cast<DWORD>(*subAuthorityCount - 1));
+    if (!subAuthority) {
+        return false;
+    }
+    *rid = *subAuthority;
+    return true;
+}
+
 void logCandidateWindowState(const std::wstring& tag, HWND hwnd) {
+    if (!Ime::isTraceLoggingEnabled()) {
+        return;
+    }
     if (!hwnd) {
         appendCandidateWindowLog(tag + L" hwnd=<null>");
         return;
@@ -150,6 +233,52 @@ HWND normalizeCandidateOwnerWindow(HWND hwnd, bool immersive, const wchar_t* rea
         << L" normalized=" << hwndToString(normalized);
     appendCandidateWindowLog(log.str());
     return normalized;
+}
+
+// WebView2/Chromium hosts run TSF in a separate msedgewebview2.exe process.
+// The window returned by ITfContextView::GetWnd() then belongs to the host
+// application.  CreateWindowEx() with an owner at a higher integrity level
+// fails with ERROR_ACCESS_DENIED (UIPI), which is exactly what happens when
+// the embedding application is elevated (for example Wuwatappo Native):
+// MoqiTextService.dll runs at medium integrity inside msedgewebview2.exe
+// while the host window belongs to an elevated process.  In that case we
+// must fall back to an unowned top-level window; otherwise the candidate
+// window is never created and the user sees no candidates at all.
+HWND sanitizeCandidateOwnerWindow(HWND hwnd, bool immersive, const wchar_t* reason) {
+    const HWND owner = normalizeCandidateOwnerWindow(hwnd, immersive, reason);
+    if (!owner) {
+        return nullptr;
+    }
+
+    DWORD ownerPid = 0;
+    ::GetWindowThreadProcessId(owner, &ownerPid);
+    if (ownerPid == 0 || ownerPid == ::GetCurrentProcessId()) {
+        return owner;
+    }
+
+    DWORD currentRid = 0;
+    DWORD ownerRid = 0;
+    const bool currentOk = processIntegrityRid(::GetCurrentProcess(), &currentRid);
+    HANDLE ownerProcess =
+        ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid);
+    const bool ownerOk = ownerProcess && processIntegrityRid(ownerProcess, &ownerRid);
+    if (ownerProcess) {
+        ::CloseHandle(ownerProcess);
+    }
+
+    // If either side cannot be queried, be conservative: an unowned top-level
+    // candidate window still works, while a cross-integrity owner does not.
+    const bool usable = currentOk && ownerOk && ownerRid <= currentRid;
+    std::wostringstream log;
+    log << L"[sanitizeCandidateOwnerWindow] reason=" << reason
+        << L" owner=" << hwndToString(owner)
+        << L" owner_pid=" << ownerPid
+        << L" self_pid=" << ::GetCurrentProcessId()
+        << L" owner_integrity=" << integrityText(ownerOk, ownerRid)
+        << L" self_integrity=" << integrityText(currentOk, currentRid)
+        << L" usable=" << (usable ? L"true" : L"false");
+    appendCandidateWindowLog(log.str());
+    return usable ? owner : nullptr;
 }
 
 void enforceCandidateWindowTopmost(HWND hwnd, bool showWindow, const wchar_t* reason) {
@@ -253,14 +382,35 @@ CandidateWindow::CandidateWindow(Ime::TextService* service, Ime::EditSession* se
     margin_ = 0;
 
     const HWND rawOwner = resolveCandidateOwnerWindow(session);
-    const HWND owner = normalizeCandidateOwnerWindow(rawOwner, service->isImmersive(), L"ctor");
-    create(owner, WS_POPUP | WS_CLIPCHILDREN,
-           WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE);
+    ownerContext_ = session != nullptr ? session->context() : nullptr;
+    cachedRawOwner_ = rawOwner;
+    cachedOwnerForeground_ = ::GetForegroundWindow();
+    ownerResolvedTick_ = ::GetTickCount64();
+    const HWND owner = sanitizeCandidateOwnerWindow(rawOwner, service->isImmersive(), L"ctor");
+    cachedOwner_ = owner;
+    const ULONGLONG skinStart = qpcMicros();
+    loadSogouSkin();
+    sogouLayered_ = hasSogouSkin();
+    const ULONGLONG createStart = qpcMicros();
+    DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+    if (sogouLayered_) {
+        exStyle |= WS_EX_LAYERED;
+    }
+    const bool created = create(owner, WS_POPUP | WS_CLIPCHILDREN, exStyle);
+    const DWORD createError = created ? 0 : ::GetLastError();
+    const ULONGLONG createEnd = qpcMicros();
+    appendSogouSkinLog(L"CandidateWindow ctor");
 
     std::wostringstream log;
     log << L"[CandidateWindow::ctor] hwnd=" << hwnd_
         << L" raw_owner=" << rawOwner
-        << L" owner=" << owner;
+        << L" owner=" << owner
+        << L" created=" << (created ? L"true" : L"false");
+    if (!created) {
+        log << L" last_error=" << createError;
+    }
+    log << L" skin_us=" << (createStart - skinStart)
+        << L" create_us=" << (createEnd - createStart);
     appendCandidateWindowLog(log.str());
     logCandidateWindowState(L"[CandidateWindow::ctor.state]", hwnd_);
 }
@@ -286,7 +436,7 @@ STDMETHODIMP CandidateWindow::GetGUID(GUID* pguid) {
 
 STDMETHODIMP CandidateWindow::Show(BOOL bShow) {
     shown_ = bShow;
-    {
+    if (Ime::isTraceLoggingEnabled()) {
         std::wostringstream log;
         log << L"[CandidateWindow::Show] bShow=" << bShow
             << L" hwnd=" << hwnd_
@@ -295,9 +445,21 @@ STDMETHODIMP CandidateWindow::Show(BOOL bShow) {
         appendCandidateWindowLog(log.str());
     }
     if (shown_) {
-        show();
-        enforceCandidateWindowTopmost(hwnd_, true, L"Show(TRUE)");
+        const bool visible = ::IsWindowVisible(hwnd_) != FALSE;
+        if (!visible) {
+            if (sogouLayered_ && !sogouEverRendered_) {
+                updateSogouLayeredWindow();
+            }
+            show();
+            enforceCandidateWindowTopmost(hwnd_, true, L"Show(TRUE)");
+        } else if ((::GetWindowLongPtr(hwnd_, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
+            enforceCandidateWindowTopmost(hwnd_, true, L"Show(TRUE).restore_topmost");
+        }
     } else {
+        if (sogouRenderTimer_) {
+            ::KillTimer(hwnd_, kSogouRenderTimerId);
+            sogouRenderTimer_ = 0;
+        }
         hide();
         logCandidateWindowState(L"[CandidateWindow::hide.state]", hwnd_);
     }
@@ -397,6 +559,7 @@ void CandidateWindow::clear() {
     itemTextWidths_.clear();
     itemCommentWidths_.clear();
     itemWidths_.clear();
+    sogouRenderDirty_ = true;
     if (::GetCapture() != hwnd_) {
         pressedSel_ = -1;
     }
@@ -431,6 +594,8 @@ void CandidateWindow::setCurrentSel(int sel) {
     }
     if (currentSel_ != sel) {
         currentSel_ = sel;
+        sogouRenderDirty_ = true;
+        scheduleSogouRender();
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -438,7 +603,11 @@ void CandidateWindow::setCurrentSel(int sel) {
 }
 
 void CandidateWindow::setUseCursor(bool use) {
-    useCursor_ = use;
+    if (useCursor_ != use) {
+        useCursor_ = use;
+        sogouRenderDirty_ = true;
+        scheduleSogouRender();
+    }
     if (isVisible()) {
         ::InvalidateRect(hwnd_, NULL, TRUE);
     }
@@ -450,9 +619,16 @@ void CandidateWindow::setPreeditText(std::wstring text) {
         if (preeditCursor_ > static_cast<int>(preedit_.length())) {
             preeditCursor_ = static_cast<int>(preedit_.length());
         }
+        // A layered Sogou-skin window paints through UpdateLayeredWindow, so
+        // WM_PAINT/InvalidateRect alone never shows the new preedit.  Mark the
+        // render state dirty and let recalculateSize()/the throttled timer
+        // repaint it (the previous code could leave the window one key
+        // behind).
+        sogouRenderDirty_ = true;
         recalculateSize();
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
+            scheduleSogouRender();
         }
     }
 }
@@ -480,6 +656,7 @@ void CandidateWindow::setCommentFont(HFONT font) {
 void CandidateWindow::setBackgroundColor(COLORREF color) {
     if (backgroundColor_ != color) {
         backgroundColor_ = color;
+        sogouRenderDirty_ = true;
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -489,6 +666,7 @@ void CandidateWindow::setBackgroundColor(COLORREF color) {
 void CandidateWindow::setHighlightColor(COLORREF color) {
     if (highlightColor_ != color) {
         highlightColor_ = color;
+        sogouRenderDirty_ = true;
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -498,6 +676,7 @@ void CandidateWindow::setHighlightColor(COLORREF color) {
 void CandidateWindow::setTextColor(COLORREF color) {
     if (textColor_ != color) {
         textColor_ = color;
+        sogouRenderDirty_ = true;
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -507,6 +686,7 @@ void CandidateWindow::setTextColor(COLORREF color) {
 void CandidateWindow::setHighlightTextColor(COLORREF color) {
     if (highlightTextColor_ != color) {
         highlightTextColor_ = color;
+        sogouRenderDirty_ = true;
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -516,6 +696,7 @@ void CandidateWindow::setHighlightTextColor(COLORREF color) {
 void CandidateWindow::setCommentColor(COLORREF color) {
     if (commentColor_ != color) {
         commentColor_ = color;
+        sogouRenderDirty_ = true;
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -525,6 +706,7 @@ void CandidateWindow::setCommentColor(COLORREF color) {
 void CandidateWindow::setCommentHighlightColor(COLORREF color) {
     if (commentHighlightColor_ != color) {
         commentHighlightColor_ = color;
+        sogouRenderDirty_ = true;
         if (isVisible()) {
             ::InvalidateRect(hwnd_, NULL, TRUE);
         }
@@ -536,14 +718,36 @@ void CandidateWindow::syncOwner(Ime::EditSession* session) {
         return;
     }
 
-    const HWND rawOwner = resolveCandidateOwnerWindow(session);
-    const HWND owner = normalizeCandidateOwnerWindow(rawOwner, textService_->isImmersive(), L"syncOwner");
+    ITfContext* context = session != nullptr ? session->context() : nullptr;
+    const HWND foreground = ::GetForegroundWindow();
+    const ULONGLONG now = ::GetTickCount64();
+    HWND rawOwner = nullptr;
+    HWND owner = nullptr;
+    const bool ownerCacheHit =
+        context != nullptr && context == ownerContext_ &&
+        cachedRawOwner_ != nullptr && foreground == cachedOwnerForeground_ &&
+        now - ownerResolvedTick_ < 2000;
+    if (ownerCacheHit) {
+        rawOwner = cachedRawOwner_;
+        owner = cachedOwner_;
+    } else {
+        rawOwner = resolveCandidateOwnerWindow(session);
+        owner = sanitizeCandidateOwnerWindow(rawOwner, textService_->isImmersive(), L"syncOwner");
+        ownerContext_ = context;
+        cachedRawOwner_ = rawOwner;
+        cachedOwner_ = owner;
+        cachedOwnerForeground_ = foreground;
+        ownerResolvedTick_ = now;
+    }
     if (owner == nullptr) {
+        const HWND currentOwner =
+            reinterpret_cast<HWND>(::GetWindowLongPtr(hwnd_, GWLP_HWNDPARENT));
+        if (currentOwner != nullptr) {
+            ::SetWindowLongPtr(hwnd_, GWLP_HWNDPARENT, 0);
+        }
         std::wostringstream log;
         log << L"[CandidateWindow::syncOwner] owner unavailable hwnd=" << hwnd_
-            << L" current_owner="
-            << reinterpret_cast<HWND>(::GetWindowLongPtr(hwnd_, GWLP_HWNDPARENT))
-            << L" current_gw_owner=" << ::GetWindow(hwnd_, GW_OWNER)
+            << L" old_owner=" << currentOwner
             << L" raw_owner=" << rawOwner
             << L" shown=" << shown_;
         appendCandidateWindowLog(log.str());
@@ -553,7 +757,6 @@ void CandidateWindow::syncOwner(Ime::EditSession* session) {
 
     const HWND currentOwner =
         reinterpret_cast<HWND>(::GetWindowLongPtr(hwnd_, GWLP_HWNDPARENT));
-    const HWND currentGwOwner = ::GetWindow(hwnd_, GW_OWNER);
     bool ownerUpdated = false;
     DWORD ownerError = 0;
     if (currentOwner != owner) {
@@ -563,26 +766,51 @@ void CandidateWindow::syncOwner(Ime::EditSession* session) {
         ownerUpdated = ownerError == 0;
     }
 
-    if (shown_) {
+    if (shown_ &&
+        (ownerUpdated ||
+         (::GetWindowLongPtr(hwnd_, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0)) {
         enforceCandidateWindowTopmost(hwnd_, true, L"syncOwner");
     }
 
-    std::wostringstream log;
-    log << L"[CandidateWindow::syncOwner] hwnd=" << hwnd_
-        << L" old_owner=" << currentOwner
-        << L" old_gw_owner=" << currentGwOwner
-        << L" raw_owner=" << rawOwner
-        << L" new_owner=" << owner
-        << L" shown=" << shown_
-        << L" owner_updated=" << (ownerUpdated ? L"true" : L"false");
-    if (ownerError != 0) {
-        log << L" last_error=" << ownerError;
+    if (Ime::isTraceLoggingEnabled()) {
+        const HWND currentGwOwner = ::GetWindow(hwnd_, GW_OWNER);
+        std::wostringstream log;
+        log << L"[CandidateWindow::syncOwner] hwnd=" << hwnd_
+            << L" old_owner=" << currentOwner
+            << L" old_gw_owner=" << currentGwOwner
+            << L" raw_owner=" << rawOwner
+            << L" new_owner=" << owner
+            << L" shown=" << shown_
+            << L" owner_updated=" << (ownerUpdated ? L"true" : L"false");
+        if (ownerError != 0) {
+            log << L" last_error=" << ownerError;
+        }
+        appendCandidateWindowLog(log.str());
+        logCandidateWindowState(L"[CandidateWindow::syncOwner.state]", hwnd_);
     }
-    appendCandidateWindowLog(log.str());
-    logCandidateWindowState(L"[CandidateWindow::syncOwner.state]", hwnd_);
+}
+
+void CandidateWindow::beginUpdate() {
+    ++updateBatchDepth_;
+}
+
+void CandidateWindow::endUpdate() {
+    if (updateBatchDepth_ <= 0) {
+        return;
+    }
+    --updateBatchDepth_;
+    if (updateBatchDepth_ == 0 && sizeDirty_) {
+        recalculateSize();
+    }
 }
 
 void CandidateWindow::recalculateSize() {
+    if (updateBatchDepth_ > 0) {
+        sizeDirty_ = true;
+        return;
+    }
+    sizeDirty_ = false;
+    const ULONGLONG recalcStart = qpcMicros();
     if (items_.empty() && preedit_.empty()) {
         selKeyWidth_ = 0;
         textWidth_ = 0;
@@ -593,6 +821,54 @@ void CandidateWindow::recalculateSize() {
         resize(padX_ * 2 + borderWidth_ * 2, padY_ * 2 + borderWidth_ * 2);
         applyWindowShape();
         return;
+    }
+
+    if (hasSogouSkin()) {
+        HDC skinDc = ::GetDC(hwnd());
+        if (skinDc) {
+            const ULONGLONG stateStart = qpcMicros();
+            const auto state = buildSogouRenderState();
+            const ULONGLONG measureStart = qpcMicros();
+            const auto layout = sogouRenderer_->measure(state, skinDc);
+            const ULONGLONG measureEnd = qpcMicros();
+            ::ReleaseDC(hwnd(), skinDc);
+            if (layout.width > 0 && layout.height > 0) {
+                sogouItemRects_ = layout.candidateRects;
+                sogouPreeditRect_ = layout.preeditRect;
+                const ULONGLONG resizeStart = qpcMicros();
+                RECT currentRect{};
+                ::GetWindowRect(hwnd_, &currentRect);
+                if (currentRect.right - currentRect.left != layout.width ||
+                    currentRect.bottom - currentRect.top != layout.height) {
+                    resize(layout.width, layout.height);
+                }
+                const ULONGLONG resizeEnd = qpcMicros();
+                applyWindowShape();
+                const ULONGLONG shapeEnd = qpcMicros();
+                sogouRenderDirty_ = true;
+                // Layout is batched once per response.  Render synchronously
+                // here so every key paints its own candidate frame even while
+                // a fast input queue keeps WM_TIMER starved.
+                const ULONGLONG renderStart = qpcMicros();
+                updateSogouLayeredWindow(true);
+                const ULONGLONG renderEnd = qpcMicros();
+                scheduleSogouRender();
+                if (Ime::isTraceLoggingEnabled()) {
+                    std::wostringstream timing;
+                    timing << L"[CandidateWindow::recalculateSize.timing] skin=true items="
+                           << items_.size()
+                           << L" size=" << layout.width << L"x" << layout.height
+                           << L" state_us=" << (measureStart - stateStart)
+                           << L" measure_us=" << (measureEnd - measureStart)
+                           << L" resize_us=" << (resizeEnd - resizeStart)
+                           << L" shape_us=" << (shapeEnd - resizeEnd)
+                           << L" render_us=" << (renderEnd - renderStart)
+                           << L" total_us=" << (renderEnd - recalcStart);
+                    appendCandidateWindowLog(timing.str());
+                }
+                return;
+            }
+        }
     }
 
     HDC hdc = ::GetWindowDC(hwnd());
@@ -706,6 +982,14 @@ void CandidateWindow::recalculateSize() {
 
 LRESULT CandidateWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_TIMER:
+        if (wp == kSogouRenderTimerId) {
+            ::KillTimer(hwnd_, kSogouRenderTimerId);
+            sogouRenderTimer_ = 0;
+            updateSogouLayeredWindow(true);
+            return 0;
+        }
+        return Window::wndProc(msg, wp, lp);
     case WM_PAINT:
         onPaint();
         return 0;
@@ -737,6 +1021,24 @@ void CandidateWindow::onPaint() {
     PAINTSTRUCT ps = {};
     BeginPaint(hwnd_, &ps);
     HDC hdc = ps.hdc;
+
+    if (hasSogouSkin()) {
+        RECT client = {};
+        ::GetClientRect(hwnd_, &client);
+        const ULONGLONG paintStart = qpcMicros();
+        updateSogouLayeredWindow();
+        const ULONGLONG paintEnd = qpcMicros();
+        if (Ime::isTraceLoggingEnabled()) {
+            std::wostringstream timing;
+            timing << L"[CandidateWindow::onPaint.timing] skin=true client="
+                   << (client.right - client.left) << L"x"
+                   << (client.bottom - client.top)
+                   << L" update_us=" << (paintEnd - paintStart);
+            appendCandidateWindowLog(timing.str());
+        }
+        EndPaint(hwnd_, &ps);
+        return;
+    }
 
     RECT rc = {};
     GetClientRect(hwnd_, &rc);
@@ -881,6 +1183,15 @@ int CandidateWindow::hitTestCandidate(POINT pt) const {
         return -1;
     }
 
+    if (hasSogouSkin()) {
+        for (int i = 0; i < static_cast<int>(sogouItemRects_.size()); ++i) {
+            if (::PtInRect(&sogouItemRects_[i], pt)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     RECT clientRc = {};
     ::GetClientRect(hwnd_, &clientRc);
     for (int i = 0, n = static_cast<int>(items_.size()); i < n; ++i) {
@@ -967,6 +1278,10 @@ void CandidateWindow::onMouseWheel(WPARAM wp, LPARAM) {
 }
 
 void CandidateWindow::itemRect(int index, RECT& rect) const {
+    if (hasSogouSkin() && index >= 0 && index < static_cast<int>(sogouItemRects_.size())) {
+        rect = sogouItemRects_[index];
+        return;
+    }
     const int row = index / candPerRow_;
     int x = borderWidth_ + padX_;
     const int rowStart = row * candPerRow_;
@@ -1013,10 +1328,154 @@ void CandidateWindow::applyWindowShape() {
         return;
     }
 
+    if (sogouLayered_) {
+        // Layered skin windows carry their own alpha shape; no window region
+        // is needed.  Avoid SetWindowRgn() on every recalculateSize(): with
+        // bRedraw=TRUE it can force a synchronous repaint of a large layered
+        // window and was a measurable per-keystroke cost.
+        return;
+    }
     HRGN region = ::CreateRoundRectRgn(
         rc.left, rc.top, rc.right + 1, rc.bottom + 1,
         borderRadius_ * 2, borderRadius_ * 2);
     ::SetWindowRgn(hwnd_, region, TRUE);
+}
+
+void CandidateWindow::loadSogouSkin() {
+    appendSogouSkinLog(L"loadSogouSkin enter");
+    std::wstring path;
+    std::wstring error;
+    auto theme = SogouSkin::LoadPreferredTheme(&error, &path);
+    if (!theme) {
+        appendSogouSkinLog(L"load failed path=" + path + L" error=" + error);
+        appendCandidateWindowLog(L"[SogouSkin] load failed path=" + path +
+                                 L" error=" + error);
+        return;
+    }
+    sogouRenderer_ = std::make_unique<SogouSkin::Renderer>(theme);
+    appendSogouSkinLog(L"loaded path=" + path);
+    appendCandidateWindowLog(L"[SogouSkin] loaded path=" + path);
+}
+
+SogouSkin::RenderState CandidateWindow::buildSogouRenderState() const {
+    SogouSkin::RenderState state;
+    state.preedit = preedit_;
+    state.candidates.reserve(items_.size());
+    for (const auto& item : items_) {
+        // Sogou skins draw candidate text only; Moqi's inline comment (e.g. a
+        // trailing ∞ marker) must not consume width or overlap the next item.
+        state.candidates.push_back(item.text);
+    }
+    state.selKeys.assign(selKeys_.begin(), selKeys_.end());
+    state.currentSel = currentSel_;
+    state.candPerRow = SogouSkin::LoadOptions().horizontal ? 9 : candPerRow_;
+    state.useCursor = useCursor_;
+    state.backgroundColor = backgroundColor_;
+    state.highlightColor = highlightColor_;
+    state.highlightTextColor = highlightTextColor_;
+    return state;
+}
+
+bool CandidateWindow::hasSogouSkin() const {
+    return sogouRenderer_ && sogouRenderer_->valid();
+}
+
+void CandidateWindow::reloadSogouSkin() {
+    sogouRenderer_.reset();
+    loadSogouSkin();
+    sogouRenderDirty_ = true;
+    sogouEverRendered_ = false;
+    const bool layered = hasSogouSkin();
+    if (layered != sogouLayered_) {
+        sogouLayered_ = layered;
+        if (hwnd_) {
+            LONG_PTR exStyle = ::GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+            if (sogouLayered_) {
+                exStyle |= WS_EX_LAYERED;
+            } else {
+                exStyle &= ~WS_EX_LAYERED;
+            }
+            ::SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, exStyle);
+            if (sogouLayered_) {
+                ::SetWindowRgn(hwnd_, nullptr, TRUE);
+            }
+            applyWindowShape();
+        }
+    }
+    if (hwnd_) {
+        ::InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+    appendCandidateWindowLog(L"[SogouSkin] reload complete layered=" +
+                             std::to_wstring(sogouLayered_ ? 1 : 0));
+}
+
+void CandidateWindow::scheduleSogouRender() {
+    if (!sogouLayered_ || !hwnd_ || sogouRenderTimer_) {
+        return;
+    }
+    sogouRenderTimer_ = ::SetTimer(
+        hwnd_, kSogouRenderTimerId, kSogouRenderThrottleMs, nullptr);
+}
+
+void CandidateWindow::updateSogouLayeredWindow(bool force) {
+    if (!sogouLayered_ || !sogouRenderer_ || !hwnd_) {
+        return;
+    }
+    if (!sogouRenderDirty_ && sogouEverRendered_) {
+        return;
+    }
+    const ULONGLONG now = ::GetTickCount64();
+    if (!force && sogouEverRendered_ &&
+        now - sogouLastRenderTick_ < kSogouRenderThrottleMs) {
+        // Rime can emit several composition/candidate updates for one key.
+        // Keep at most one layered paint per frame; the timer renders the
+        // latest state after the burst settles.
+        if (!sogouRenderTimer_) {
+            sogouRenderTimer_ = ::SetTimer(
+                hwnd_, kSogouRenderTimerId, kSogouRenderThrottleMs, nullptr);
+        }
+        return;
+    }
+    if (sogouRenderTimer_) {
+        ::KillTimer(hwnd_, kSogouRenderTimerId);
+        sogouRenderTimer_ = 0;
+    }
+    const ULONGLONG start = qpcMicros();
+    const auto state = buildSogouRenderState();
+    const ULONGLONG stateEnd = qpcMicros();
+    int width = 0;
+    int height = 0;
+    auto bitmap = sogouRenderer_->renderToBitmap(state, &width, &height);
+    const ULONGLONG renderEnd = qpcMicros();
+    bool updated = false;
+    if (bitmap) {
+        updated = SogouSkin::UpdateLayeredWindowBitmap(hwnd_, bitmap.get());
+    }
+    if (updated) {
+        sogouRenderDirty_ = false;
+        sogouEverRendered_ = true;
+        sogouLastRenderTick_ = ::GetTickCount64();
+    }
+    const ULONGLONG updateEnd = qpcMicros();
+    if (Ime::isTraceLoggingEnabled()) {
+        const auto& renderTiming = sogouRenderer_->lastRenderTiming();
+        std::wostringstream timing;
+        timing << L"[CandidateWindow::updateSogouLayeredWindow.timing] size="
+               << width << L"x" << height
+               << L" state_us=" << (stateEnd - start)
+               << L" render_us=" << (renderEnd - stateEnd)
+               << L" build_us=" << renderTiming.buildUs
+               << L" bitmap_us=" << renderTiming.bitmapUs
+               << L" paint_us=" << renderTiming.paintUs
+               << L" bg_us=" << renderTiming.backgroundUs
+               << L" text_us=" << renderTiming.textUs
+               << L" arrow_us=" << renderTiming.arrowUs
+               << L" image_draws=" << renderTiming.imageDraws
+               << L" update_us=" << (updateEnd - renderEnd)
+               << L" total_us=" << (updateEnd - start)
+               << L" updated=" << (updated ? L"true" : L"false");
+        appendCandidateWindowLog(timing.str());
+    }
 }
 
 } // namespace Moqi

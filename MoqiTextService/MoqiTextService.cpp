@@ -27,6 +27,9 @@
 #include <libIME2/src/Utils.h>
 #include <libIME2/src/LangBarButton.h>
 #include "MoqiImeModule.h"
+#include "SogouSkin/SogouSkin.h"
+#include "KeyRepeatAccelerator.h"
+#include "SogouSymbols.h"
 #include "resource.h"
 #include <Shellapi.h>
 #include <sys/stat.h>
@@ -45,7 +48,64 @@ std::wstring processBaseName(const std::wstring& imagePath);
 std::wstring timestampNow();
 std::wstring formatDebugLogLine(const std::wstring& message);
 constexpr wchar_t kDefaultCommentFontFace[] = L"Consolas";
+// The native candidate window previously inherited DEFAULT_GUI_FONT, which can
+// resolve to SimSun on some Chinese installations.  Use the Windows UI sans
+// face unless appearance_config.json sends candFontName explicitly.
+constexpr wchar_t kDefaultCandidateFontFace[] = L"Microsoft YaHei UI";
 constexpr ULONGLONG kCandidateWindowMoveThrottleMs = 50;
+
+// Command IDs of the moqi-ime Rime backend.  They are stable public constants
+// in input_methods/rime/rime.go and let the Sogou status bar drive the same
+// state as the native language-bar buttons.
+constexpr UINT kMoqiCommandAsciiMode = 2;
+constexpr UINT kMoqiCommandFullShape = 3;
+constexpr UINT kMoqiCommandAsciiPunct = 4;
+constexpr UINT kMoqiCommandTraditionalization = 5;
+
+const wchar_t* BackendButtonIdForSogouItem(const std::wstring& itemName) {
+	if (itemName == L"cn_en") {
+		return L"switch-lang";
+	}
+	if (itemName == L"quan_ban") {
+		return L"switch-shape";
+	}
+	return nullptr;
+}
+
+void SaveSogouOptions(const SogouSkin::Options& options) {
+	const std::wstring path = SogouSkin::OptionsPath();
+	if (path.empty()) {
+		return;
+	}
+	const std::wstring dir = SogouSkin::ConfigDirectory();
+	if (!dir.empty()) {
+		::CreateDirectoryW(dir.c_str(), nullptr);
+	}
+	std::ofstream file(path, std::ios::binary | std::ios::trunc);
+	if (!file) {
+		return;
+	}
+	std::string hidden;
+	for (const auto& item : options.hiddenStatusItems) {
+		if (!hidden.empty()) {
+			hidden += ",";
+		}
+		for (wchar_t ch : item) {
+			hidden += static_cast<char>(ch < 128 ? ch : '?');
+		}
+	}
+	file << "[Options]\n";
+	file << "statusbar=" << (options.statusbar ? 1 : 0) << "\n";
+	file << "horizontal=" << (options.horizontal ? 1 : 0) << "\n";
+	file << "key_repeat=" << (options.keyRepeat ? 1 : 0) << "\n";
+	file << "statusbar_hide=" << hidden << "\n";
+	if (options.statusbarX >= 0) {
+		file << "statusbar_x=" << options.statusbarX << "\n";
+	}
+	if (options.statusbarY >= 0) {
+		file << "statusbar_y=" << options.statusbarY << "\n";
+	}
+}
 
 bool callClientFilterKeyDown(Client* client, Ime::KeyEvent& keyEvent, bool& sehCaught) {
 	sehCaught = false;
@@ -226,6 +286,21 @@ std::wstring timestampNow() {
 	return buffer;
 }
 
+ULONGLONG qpcMicros() {
+	static LARGE_INTEGER frequency = [] {
+		LARGE_INTEGER value{};
+		::QueryPerformanceFrequency(&value);
+		return value;
+	}();
+	LARGE_INTEGER counter{};
+	::QueryPerformanceCounter(&counter);
+	if (frequency.QuadPart <= 0) {
+		return 0;
+	}
+	return static_cast<ULONGLONG>(
+		(counter.QuadPart * 1000000ULL) / frequency.QuadPart);
+}
+
 std::wstring formatDebugLogLine(const std::wstring& message) {
 	std::wostringstream line;
 	line << L"[" << timestampNow() << L"]"
@@ -283,6 +358,15 @@ bool isOrdinaryPrintableKey(const Ime::KeyEvent& keyEvent) {
 	       keyEvent.charCode() != 0x7f &&
 	       !keyEvent.isKeyDown(VK_CONTROL) &&
 	       !keyEvent.isKeyDown(VK_MENU);
+}
+
+bool hasKeyRepeatBlocker(const Ime::KeyEvent& keyEvent) {
+	// Only plain typing is accelerated.  Ctrl/Alt/Win combinations, candidate
+	// selection keys and navigation keys must keep their original behaviour.
+	return keyEvent.isKeyDown(VK_CONTROL) ||
+	       keyEvent.isKeyDown(VK_MENU) ||
+	       keyEvent.isKeyDown(VK_LWIN) ||
+	       keyEvent.isKeyDown(VK_RWIN);
 }
 
 bool shouldForceUiLessForProcess(const std::wstring& imagePath) {
@@ -348,6 +432,7 @@ TextService::TextService(ImeModule* module):
 	candSpacing_(20),
 	selKeys_(L"1234567890"),
 	candUseCursor_(true),
+	candFontName_(kDefaultCandidateFontFace),
 	candCommentFontName_(kDefaultCommentFontFace),
 	candFontSize_(16),
 	candCommentFontSize_(14),
@@ -364,12 +449,22 @@ TextService::TextService(ImeModule* module):
 	currentLangProfile_(GUID_NULL) {
 	shouldShowCandidateWindowUI_ = !effectiveUiLess();
 
+	keyRepeat_ = std::make_unique<KeyRepeatAccelerator>(
+		[this](WORD vk) { injectSogouKeyRepeat(vk); });
+	configureKeyRepeat();
+
 	// font for candidate and mesasge windows
 	font_ = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 	LOGFONT lf;
 	GetObject(font_, sizeof(lf), &lf);
 	lf.lfHeight = candFontHeight(); // FIXME: make this configurable
 	lf.lfWeight = FW_NORMAL;
+	{
+		const std::wstring& candidateFontName =
+			candFontName_.empty() ? std::wstring(kDefaultCandidateFontFace) : candFontName_;
+		wcsncpy_s(lf.lfFaceName, _countof(lf.lfFaceName), candidateFontName.c_str(),
+		          _TRUNCATE);
+	}
 	font_ = CreateFontIndirect(&lf);
 	lf.lfHeight = candCommentFontHeight();
 	const std::wstring& commentFontName =
@@ -383,10 +478,15 @@ TextService::~TextService(void) {
 		closeClient();
 	}
 
+	stopKeyRepeat();
+	keyRepeat_.reset();
+
 	if(popupMenu_)
 		::DestroyMenu(popupMenu_);
 
 	destroyCandidateWindow();
+
+	sogouStatusBar_.reset();
 
 	if(messageWindow_)
 		hideMessage();
@@ -395,6 +495,465 @@ TextService::~TextService(void) {
 		::DeleteObject(font_);
 	if(commentFont_)
 		::DeleteObject(commentFont_);
+}
+
+void TextService::ensureSogouSkinMode() {
+	if (sogouSkinChecked_) {
+		return;
+	}
+	sogouSkinChecked_ = true;
+	std::wstring error;
+	sogouTheme_ = SogouSkin::LoadPreferredTheme(&error);
+	sogouSkinMode_ = sogouTheme_ != nullptr;
+}
+
+void TextService::ensureSogouStatusBar() {
+	ensureSogouSkinMode();
+	if (!sogouSkinMode_ || !sogouTheme_ || sogouTheme_->statusBar().pic.empty()) {
+		return;
+	}
+	const auto options = SogouSkin::LoadOptions();
+	if (!options.statusbar) {
+		if (sogouStatusBar_) {
+			sogouStatusBar_->hide();
+		}
+		return;
+	}
+	if (sogouStatusBar_) {
+		return;
+	}
+	auto bar = std::make_unique<SogouSkin::StatusBarWindow>(
+		sogouTheme_, [this](const std::wstring& name) {
+			handleSogouStatusBarClick(name);
+		},
+		[this](const std::wstring& name) {
+			return sogouStatusBarItemState(name);
+		});
+	bar->setContextMenuHandler([this](POINT pt) {
+		showSogouStatusBarMenu(pt);
+	});
+	bar->setSettingsChangedHandler([this]() {
+		reloadSogouSkinFromFiles();
+	});
+	bar->setVisibilityChangedHandler([](bool visible) {
+		logDebug(std::wstring(L"[SogouStatusBar] ") +
+		         (visible ? L"shown" : L"hidden") + L" " +
+		         foregroundWindowSummary());
+	});
+	if (bar->create()) {
+		sogouStatusBar_ = std::move(bar);
+	}
+}
+
+void TextService::refreshSogouStatusBar() {
+	if (sogouStatusBar_) {
+		// This runs on every key-up.  Only a state-image change needs a
+		// layered-window repaint; colouring it every keystroke made SearchHost
+		// and other lightweight TSF hosts visibly sluggish.
+		sogouStatusBar_->refreshIfStateChanged();
+	}
+}
+
+int TextService::sogouStatusBarItemState(const std::wstring& itemName) const {
+	if (itemName == L"softkeyboard") {
+		return isKeyboardOpened() ? 1 : 0;
+	}
+	if (!client_) {
+		const auto it = sogouStatusBarLocalStates_.find(itemName);
+		return it == sogouStatusBarLocalStates_.end() ? 0 : it->second;
+	}
+	LangBarButton* button = nullptr;
+	if (const wchar_t* backendId = BackendButtonIdForSogouItem(itemName)) {
+		button = client_->findButton(utf16ToUtf8(backendId));
+	}
+	if (!button && itemName == L"cn_en") {
+		// Windows 8+/11 mode icon is the fallback when the backend chooses not
+		// to create the separate switch-lang button.
+		button = client_->findButton("windows-mode-icon");
+	}
+	if (!button) {
+		const auto it = sogouStatusBarLocalStates_.find(itemName);
+		return it == sogouStatusBarLocalStates_.end() ? 0 : it->second;
+	}
+
+	const std::wstring icon = toLowerCopy(button->iconFile());
+	if (itemName == L"cn_en") {
+		// moqi-ime publishes chi.ico / eng.ico through switch-lang, and
+		// chi_*.ico / eng_*.ico through windows-mode-icon.
+		if (icon.find(L"eng") != std::wstring::npos) {
+			return 1;
+		}
+		if (icon.find(L"chi") != std::wstring::npos) {
+			return 0;
+		}
+		const wchar_t* text = button->text();
+		if (text) {
+			const std::wstring value(text);
+			if (value.find(L"A") != std::wstring::npos) {
+				return 2;
+			}
+			if (value.find(L"英") != std::wstring::npos) {
+				return 1;
+			}
+			if (value.find(L"中") != std::wstring::npos) {
+				return 0;
+			}
+		}
+		return button->toggled() ? 1 : 0;
+	}
+	if (itemName == L"quan_ban") {
+		// switch-shape publishes full.ico / half.ico.
+		if (icon.find(L"full") != std::wstring::npos) {
+			return 0;
+		}
+		if (icon.find(L"half") != std::wstring::npos) {
+			return 1;
+		}
+		return button->toggled() ? 1 : 0;
+	}
+	return button->toggled() ? 1 : 0;
+}
+
+void TextService::handleSogouStatusBarClick(const std::wstring& itemName) {
+	if (itemName == L"menu") {
+		openSogouSkinSettings();
+		return;
+	}
+	if (itemName == L"softkeyboard") {
+		::ShellExecuteW(
+			nullptr, L"open",
+			L"C:\\Program Files\\Common Files\\Microsoft Shared\\ink\\TabTip.exe",
+			nullptr, nullptr, SW_SHOWNORMAL);
+		return;
+	}
+	// These skin buttons do not have a stable moqi-ime command yet.  Do not
+	// synthesize app shortcuts (Ctrl+Shift+S etc.), which can trigger unrelated
+	// application commands such as Save As.
+	if (itemName == L"quan_shuang" || itemName == L"sogousearch") {
+		return;
+	}
+	if (client_) {
+		UINT commandId = 0;
+		if (itemName == L"cn_en") {
+			commandId = kMoqiCommandAsciiMode;
+		} else if (itemName == L"quan_ban") {
+			commandId = kMoqiCommandFullShape;
+		} else if (itemName == L"biaodian") {
+			commandId = kMoqiCommandAsciiPunct;
+		} else if (itemName == L"fan_jian") {
+			commandId = kMoqiCommandTraditionalization;
+		}
+		if (commandId != 0) {
+			if (commandId == kMoqiCommandAsciiPunct ||
+			    commandId == kMoqiCommandTraditionalization) {
+				// These options do not have a language-bar button whose state we
+				// can read back, so keep a local visual toggle for the skin icon.
+				sogouStatusBarLocalStates_[itemName] ^= 1;
+			}
+			client_->onCommand(commandId, COMMAND_LEFT_CLICK);
+			refreshSogouStatusBar();
+			return;
+		}
+		const std::string id = utf16ToUtf8(itemName.c_str());
+		if (auto* button = client_->findButton(id)) {
+			onCommand(button->commandId(), COMMAND_LEFT_CLICK);
+			return;
+		}
+	}
+	auto sendKey = [](WORD vk, bool up) {
+		INPUT input = {};
+		input.type = INPUT_KEYBOARD;
+		input.ki.wVk = vk;
+		input.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+		::SendInput(1, &input, sizeof(input));
+	};
+	auto sendCombo = [&](std::initializer_list<WORD> modifiers, WORD key) {
+		for (WORD modifier : modifiers) {
+			sendKey(modifier, false);
+		}
+		sendKey(key, false);
+		sendKey(key, true);
+		for (auto it = modifiers.end(); it != modifiers.begin();) {
+			--it;
+			sendKey(*it, true);
+		}
+	};
+
+	if (itemName == L"cn_en") {
+		// Standard IME Chinese/English toggle.
+		sendKey(VK_SHIFT, false);
+		sendKey(VK_SHIFT, true);
+	} else if (itemName == L"quan_ban") {
+		sendCombo({VK_SHIFT}, VK_SPACE);
+	} else if (itemName == L"biaodian") {
+		sendCombo({VK_CONTROL}, VK_OEM_PERIOD);
+	} else if (itemName == L"fan_jian") {
+		sendCombo({VK_CONTROL, VK_SHIFT}, 'F');
+	} else {
+		return;
+	}
+
+	const int count = itemName == L"cn_en" ? 2 : 2;
+	const int current = sogouStatusBarLocalStates_[itemName];
+	sogouStatusBarLocalStates_[itemName] = (current + 1) % count;
+	refreshSogouStatusBar();
+}
+
+void TextService::showSogouStatusBarMenu(POINT screenPoint) {
+	if (!sogouStatusBar_) {
+		return;
+	}
+	static const struct QuickItem {
+		const wchar_t* name;
+		const wchar_t* label;
+	} quickItems[] = {
+		{L"cn_en", L"中英文切换"},
+		{L"quan_ban", L"全角 / 半角"},
+		{L"biaodian", L"中文 / 英文标点"},
+		{L"fan_jian", L"简体 / 繁体"},
+		{L"softkeyboard", L"软键盘"},
+	};
+	const int quickCount = static_cast<int>(_countof(quickItems));
+	const auto options = SogouSkin::LoadOptions();
+
+	HMENU menu = ::CreatePopupMenu();
+	if (!menu) {
+		return;
+	}
+	for (int i = 0; i < quickCount; ++i) {
+		const int state = sogouStatusBarItemState(quickItems[i].name);
+		::AppendMenuW(menu, MF_STRING | (state != 0 ? MF_CHECKED : 0),
+		              static_cast<UINT_PTR>(i + 1), quickItems[i].label);
+	}
+	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+	if (HMENU symbolMenu = CreateSogouSymbolMenu()) {
+		::AppendMenuW(menu, MF_POPUP,
+		              reinterpret_cast<UINT_PTR>(symbolMenu), L"符号输入");
+	}
+	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+	::AppendMenuW(menu, MF_STRING | (options.horizontal ? MF_CHECKED : 0), 100,
+	              L"候选窗横排");
+	::AppendMenuW(menu, MF_STRING | (options.statusbar ? MF_CHECKED : 0), 101,
+	              L"显示皮肤状态栏");
+	::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+	::AppendMenuW(menu, MF_STRING, 110, L"皮肤设置...");
+	::AppendMenuW(menu, MF_STRING, 111, L"重新加载皮肤");
+
+	HWND owner = sogouStatusBar_->hwnd();
+	const HWND previousForeground = ::GetForegroundWindow();
+	::SetForegroundWindow(owner);
+	const UINT command = ::TrackPopupMenuEx(
+		menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+		screenPoint.x, screenPoint.y, owner, nullptr);
+	::DestroyMenu(menu);
+	::PostMessageW(owner, WM_NULL, 0, 0);
+	if (previousForeground && previousForeground != owner) {
+		::SetForegroundWindow(previousForeground);
+	}
+
+	if (command == 0) {
+		return;
+	}
+	if (command <= static_cast<UINT>(quickCount)) {
+		handleSogouStatusBarClick(quickItems[command - 1].name);
+		return;
+	}
+	if (const std::wstring* symbol = SogouSymbolForCommand(command)) {
+		insertSogouSymbol(*symbol);
+		return;
+	}
+	if (command == 100) {
+		SogouSkin::Options updated = options;
+		updated.horizontal = !updated.horizontal;
+		SaveSogouOptions(updated);
+		reloadSogouSkinFromFiles();
+	} else if (command == 101) {
+		SogouSkin::Options updated = options;
+		updated.statusbar = !updated.statusbar;
+		SaveSogouOptions(updated);
+		setSogouStatusBarVisible(updated.statusbar);
+	} else if (command == 110) {
+		openSogouSkinSettings();
+	} else if (command == 111) {
+		reloadSogouSkinFromFiles();
+	}
+}
+
+void TextService::insertSogouSymbol(const std::wstring& text) {
+	if (text.empty()) {
+		return;
+	}
+	stopKeyRepeat();
+	auto context = currentContext();
+	if (!context) {
+		logDebug(L"[SogouSymbol] no current context");
+		return;
+	}
+
+	// A symbol is a standalone commit; do not insert it into the middle of an
+	// active pinyin composition.  Clear the composition range first, then end
+	// it, so clicking a symbol never commits the raw pinyin string.
+	if (isComposing()) {
+		auto clearSession = Ime::ComPtr<Ime::EditSession>::make(
+			context, [this](Ime::EditSession* editSession, TfEditCookie) {
+				setCompositionString(editSession, L"", 0);
+			});
+		if (clearSession) {
+			HRESULT clearResult = E_FAIL;
+			context->RequestEditSession(clientId(), clearSession,
+			                            TF_ES_SYNC | TF_ES_READWRITE,
+			                            &clearResult);
+		}
+		endComposition(context);
+	}
+
+	HRESULT sessionResult = E_FAIL;
+	auto session = Ime::ComPtr<Ime::EditSession>::make(
+		context,
+		[context, text](Ime::EditSession* editSession, TfEditCookie cookie) {
+			auto insertAtSelection =
+				Ime::ComPtr<ITfInsertAtSelection>::queryFrom(context);
+			if (!insertAtSelection) {
+				return;
+			}
+			Ime::ComPtr<ITfRange> range;
+			insertAtSelection->InsertTextAtSelection(
+				cookie, 0, text.c_str(), static_cast<LONG>(text.size()), &range);
+		});
+	if (session) {
+		context->RequestEditSession(clientId(), session,
+		                            TF_ES_SYNC | TF_ES_READWRITE,
+		                            &sessionResult);
+	}
+	if (FAILED(sessionResult)) {
+		logDebug(L"[SogouSymbol] InsertTextAtSelection failed hr=" +
+		         std::to_wstring(static_cast<long>(sessionResult)));
+	} else {
+		logDebug(L"[SogouSymbol] inserted codepoints=" +
+		         std::to_wstring(text.size()));
+	}
+}
+
+void TextService::reloadSogouSkinFromFiles() {
+	std::wstring error;
+	auto theme = SogouSkin::LoadPreferredTheme(&error);
+	if (!theme) {
+		sogouSkinMode_ = false;
+		sogouSkinChecked_ = true;
+		sogouTheme_.reset();
+		if (sogouStatusBar_) {
+			sogouStatusBar_->hide();
+		}
+		if (candidateWindow_) {
+			candidateWindow_->reloadSogouSkin();
+		}
+		logDebug(L"[SogouSkin] reload failed: " + error);
+		return;
+	}
+	sogouTheme_ = theme;
+	sogouSkinMode_ = true;
+	sogouSkinChecked_ = true;
+	if (!theme->statusBar().pic.empty()) {
+		const bool statusbarEnabled = SogouSkin::LoadOptions().statusbar;
+		if (sogouStatusBar_) {
+			sogouStatusBar_->setTheme(theme);
+			if (statusbarEnabled) {
+				sogouStatusBar_->show();
+			} else {
+				sogouStatusBar_->hide();
+			}
+		} else {
+			ensureSogouStatusBar();
+			// create() intentionally leaves the window hidden; only this
+			// process may show it, and show() re-validates the foreground.
+			if (sogouStatusBar_ && statusbarEnabled) {
+				sogouStatusBar_->show();
+			}
+		}
+	} else if (sogouStatusBar_) {
+		sogouStatusBar_->hide();
+	}
+	if (candidateWindow_) {
+		candidateWindow_->reloadSogouSkin();
+	}
+	refreshSogouStatusBar();
+	logDebug(L"[SogouSkin] reloaded");
+}
+
+void TextService::openSogouSkinSettings() {
+	std::wstring dir;
+	if (imeModule()) {
+		auto* module = static_cast<Moqi::ImeModule*>(imeModule().operator->());
+		if (module) {
+			dir = module->programDir();
+		}
+	}
+	std::wstring exe = dir.empty() ? std::wstring() : dir + L"\\SogouSkinSettings.exe";
+	if (!exe.empty() &&
+	    ::GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+		::ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr,
+		                dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+		return;
+	}
+	::MessageBoxW(nullptr,
+	              L"未找到 SogouSkinSettings.exe。\n请重新运行部署脚本，或从构建目录手动启动设置程序。",
+	              L"墨奇输入法 - 搜狗皮肤", MB_OK | MB_ICONWARNING);
+}
+
+void TextService::setSogouStatusBarVisible(bool visible) {
+	if (visible) {
+		ensureSogouStatusBar();
+		const auto options = SogouSkin::LoadOptions();
+		if (sogouStatusBar_ && options.statusbar) {
+			sogouStatusBar_->show();
+		} else if (SogouSkin::IsForegroundProcess(::GetCurrentProcessId())) {
+			// This TSF host has no skin status bar of its own (skin has no
+			// [StatusBar], the option is off, or this process cannot render
+			// one).  Clear the previous application's bar immediately instead
+			// of waiting for its 150ms foreground guard.  UWP and other hosts
+			// without a TSF service are still covered by that guard.
+			SogouSkin::HideOtherStatusBarWindows(nullptr);
+		}
+	}
+	else if (sogouStatusBar_) {
+		sogouStatusBar_->hide();
+	}
+}
+
+void TextService::configureKeyRepeat() {
+	if (!keyRepeat_) {
+		return;
+	}
+	const auto options = SogouSkin::LoadOptions();
+	keyRepeat_->configure(options.keyRepeat);
+}
+
+void TextService::stopKeyRepeat() {
+	if (keyRepeat_) {
+		keyRepeat_->onFocusLost();
+	}
+	keyRepeatForeground_ = nullptr;
+	suppressRepeatKeyDown_ = false;
+	suppressedRepeatKey_ = 0;
+}
+
+void TextService::injectSogouKeyRepeat(WORD vk) {
+	if (!keyRepeat_ || !keyRepeat_->enabled() || !client_) {
+		stopKeyRepeat();
+		return;
+	}
+	// SendInput targets the foreground queue.  Abort the moment focus moves
+	// so repeats can never leak into another application.
+	const HWND foreground = ::GetForegroundWindow();
+	if (!foreground || foreground != keyRepeatForeground_) {
+		stopKeyRepeat();
+		return;
+	}
+	if (!currentContext()) {
+		stopKeyRepeat();
+		return;
+	}
+	KeyRepeatAccelerator::InjectKeyDown(vk);
 }
 
 // virtual
@@ -414,12 +973,24 @@ void TextService::onActivate() {
 	    << L" manual_ui_less=" << boolText(manualUiLessOverride_)
 	    << L" " << foregroundWindowSummary();
 	logDebug(log.str());
+	configureKeyRepeat();
+	ensureSogouSkinMode();
 	ensureClientForCurrentProfile(L"onActivate");
+	setSogouStatusBarVisible(true);
 }
 
 // virtual
 void TextService::onDeactivate() {
 	logDebug(L"[onDeactivate] exe=" + processBaseName(currentProcessPath()) + L" " + foregroundWindowSummary());
+	stopKeyRepeat();
+	// Low-latency hide: only when the foreground window has actually moved to
+	// another process.  If TSF deactivates this thread while the application
+	// is still foreground (status-bar clicks, focus moves inside the app),
+	// the check keeps the bar visible; the 150ms timer remains the fallback
+	// for hosts that do not deliver deactivate/kill-focus at all.
+	if (sogouStatusBar_) {
+		sogouStatusBar_->checkForegroundNow();
+	}
 	if(client_) {
 		closeClient();
 	}
@@ -431,6 +1002,7 @@ void TextService::onFocus() {
 
 // virtual
 void TextService::onSetFocus() {
+	setSogouStatusBarVisible(true);
 	std::wostringstream log;
 	log << L"[onSetFocus] exe=" << processBaseName(currentProcessPath())
 		<< L" showing_candidates=" << boolText(showingCandidates_)
@@ -441,6 +1013,10 @@ void TextService::onSetFocus() {
 
 // virtual
 void TextService::onKillFocus() {
+	stopKeyRepeat();
+	if (sogouStatusBar_) {
+		sogouStatusBar_->checkForegroundNow();
+	}
 	std::wostringstream log;
 	log << L"[onKillFocus] exe=" << processBaseName(currentProcessPath())
 		<< L" showing_candidates=" << boolText(showingCandidates_)
@@ -451,6 +1027,7 @@ void TextService::onKillFocus() {
 
 // virtual
 void TextService::onSetThreadFocus() {
+	setSogouStatusBarVisible(true);
 	std::wostringstream log;
 	log << L"[onSetThreadFocus] exe=" << processBaseName(currentProcessPath())
 	    << L" keyboard_open=" << boolText(isKeyboardOpened())
@@ -464,6 +1041,10 @@ void TextService::onSetThreadFocus() {
 
 // virtual
 void TextService::onKillThreadFocus() {
+	stopKeyRepeat();
+	if (sogouStatusBar_) {
+		sogouStatusBar_->checkForegroundNow();
+	}
 	std::wostringstream log;
 	log << L"[onKillThreadFocus] exe=" << processBaseName(currentProcessPath())
 		<< L" showing_candidates=" << boolText(showingCandidates_)
@@ -487,6 +1068,47 @@ bool TextService::filterKeyDown(Ime::KeyEvent& keyEvent) {
 		}
 		return false;
 	}
+	{
+		const WORD key = static_cast<WORD>(keyEvent.keyCode());
+		if (key == VK_SHIFT) {
+			if (!shiftTapCandidate_ && !isComposing() &&
+			    !hasKeyRepeatBlocker(keyEvent)) {
+				shiftTapCandidate_ = true;
+				shiftTapUsed_ = false;
+				shiftTapStartTick_ = ::GetTickCount64();
+			}
+		} else if (shiftTapCandidate_) {
+			shiftTapUsed_ = true;
+		}
+	}
+	if (keyRepeat_ && keyRepeat_->enabled()) {
+		const WORD key = static_cast<WORD>(keyEvent.keyCode());
+		// Never re-arm on our own SendInput events.  This check is
+		// deliberately independent of active(): if the user releases the
+		// physical key before the injected key-down reaches the queue, a new
+		// accelerator must not start without a matching key-up.
+		const bool synthetic = KeyRepeatAccelerator::IsInjectedEvent();
+		if (!synthetic) {
+			const bool wasActive = keyRepeat_->active();
+			const bool consume = keyRepeat_->onKeyDown(
+				key,
+				keyEvent.repeatCount(),
+				hasKeyRepeatBlocker(keyEvent),
+				showingCandidates(),
+				::GetTickCount64());
+			if (!wasActive && keyRepeat_->active()) {
+				keyRepeatForeground_ = ::GetForegroundWindow();
+			}
+			if (consume) {
+				// The accelerator emits the burst itself; swallow the OS
+				// repeat so the two rates do not add up.  onKeyDown() must
+				// also skip the backend for this same event.
+				suppressRepeatKeyDown_ = true;
+				suppressedRepeatKey_ = key;
+				return true;
+			}
+		}
+	}
 	try {
 		bool sehCaught = false;
 		const bool result = callClientFilterKeyDown(client_.get(), keyEvent, sehCaught);
@@ -507,6 +1129,12 @@ bool TextService::filterKeyDown(Ime::KeyEvent& keyEvent) {
 bool TextService::onKeyDown(Ime::KeyEvent& keyEvent, Ime::EditSession* session) {
 	logDebug(L"[onKeyDown] " + keyEventSummary(keyEvent) +
 		L" client=" + boolText(client_ != nullptr));
+	if (suppressRepeatKeyDown_ &&
+	    static_cast<WORD>(keyEvent.keyCode()) == suppressedRepeatKey_) {
+		suppressRepeatKeyDown_ = false;
+		return true;
+	}
+	suppressRepeatKeyDown_ = false;
 	//if (keyEvent.isKeyToggled(VK_CAPITAL))
 	//	return true;
 	if (!client_)
@@ -531,15 +1159,45 @@ bool TextService::onKeyDown(Ime::KeyEvent& keyEvent, Ime::EditSession* session) 
 bool TextService::filterKeyUp(Ime::KeyEvent& keyEvent) {
 	logDebug(L"[filterKeyUp] " + keyEventSummary(keyEvent) +
 		L" client=" + boolText(client_ != nullptr));
+	if (keyRepeat_) {
+		keyRepeat_->onKeyUp(static_cast<WORD>(keyEvent.keyCode()));
+		if (suppressedRepeatKey_ ==
+		    static_cast<WORD>(keyEvent.keyCode())) {
+			suppressRepeatKeyDown_ = false;
+			suppressedRepeatKey_ = 0;
+		}
+	}
 	if(!client_)
 		return false;
 	try {
 		bool sehCaught = false;
+		std::wstring shiftIconBefore;
+		LangBarButton* shiftButton = nullptr;
+		const bool shiftTap = keyEvent.keyCode() == VK_SHIFT &&
+		                      shiftTapCandidate_ && !shiftTapUsed_;
+		if (shiftTap) {
+			shiftButton = client_->findButton("switch-lang");
+			if (shiftButton) {
+				shiftIconBefore = shiftButton->iconFile();
+			}
+		}
 		const bool result = callClientFilterKeyUp(client_.get(), keyEvent, sehCaught);
 		if (sehCaught) {
 			logDebug(L"[filterKeyUp] caught SEH exception from client");
 			closeClient();
+		} else if (shiftTap && shiftButton && client_ &&
+		           !shiftTapUsed_ &&
+		           ::GetTickCount64() - shiftTapStartTick_ < 500) {
+			// Rime's ascii_composer handles Shift while composing.  A bare
+			// Shift tap in an empty buffer can be a no-op in some schemas;
+			// if the backend did not change the switch-lang icon, toggle it
+			// through the same command used by the language-bar button.
+			if (shiftButton->iconFile() == shiftIconBefore) {
+				client_->onCommand(kMoqiCommandAsciiMode, COMMAND_LEFT_CLICK);
+			}
 		}
+		shiftTapCandidate_ = false;
+		shiftTapUsed_ = false;
 		return result;
 	}
 	catch (...) {
@@ -553,6 +1211,11 @@ bool TextService::filterKeyUp(Ime::KeyEvent& keyEvent) {
 bool TextService::onKeyUp(Ime::KeyEvent& keyEvent, Ime::EditSession* session) {
 	logDebug(L"[onKeyUp] " + keyEventSummary(keyEvent) +
 		L" client=" + boolText(client_ != nullptr));
+	if (keyRepeat_) {
+		keyRepeat_->onKeyUp(static_cast<WORD>(keyEvent.keyCode()));
+		suppressRepeatKeyDown_ = false;
+		suppressedRepeatKey_ = 0;
+	}
 	if(!client_)
 		return false;
 	try {
@@ -667,6 +1330,7 @@ void TextService::onKeyboardStatusChanged(bool opened) {
 	Ime::TextService::onKeyboardStatusChanged(opened);
 	if(client_)
 		client_->onKeyboardStatusChanged(opened);
+	refreshSogouStatusBar();
 	if(opened) { // keyboard is opened
 	}
 	else { // keyboard is closed
@@ -688,6 +1352,10 @@ void TextService::onKeyboardStatusChanged(bool opened) {
 // if forced is false, the composition is terminated gracefully by endComposition().
 // virtual
 void TextService::onCompositionTerminated(bool forced) {
+	if (forced) {
+		// Focus was taken away by another app/context; never keep injecting.
+		stopKeyRepeat();
+	}
 	// we do special handling here for forced composition termination.
 	if (!forced && suppressNextCompositionTerminatedNotification_) {
 		suppressNextCompositionTerminatedNotification_ = false;
@@ -867,6 +1535,7 @@ void TextService::destroyCandidateWindow() {
 }
 
 void TextService::updateCandidates(Ime::EditSession* session) {
+	const ULONGLONG fnStart = qpcMicros();
 	if (!tsfCandidateUiEnabled()) {
 		appendCandidateWindowLog(L"[TextService::updateCandidates] skipped by process policy");
 		return;
@@ -876,12 +1545,15 @@ void TextService::updateCandidates(Ime::EditSession* session) {
 		return;
 	}
 	candidateWindow_->syncOwner(session);
+	const ULONGLONG ownerEnd = qpcMicros();
 
 	applyCandidateAppearanceNow();
 
 	const std::wstring renderedPreedit = effectiveInlinePreedit() ? L"" : candidatePreedit_;
 	const bool contentChanged = !isCandidateContentApplied(renderedPreedit);
+	const ULONGLONG contentStart = qpcMicros();
 	if (contentChanged) {
+		candidateWindow_->beginUpdate();
 		candidateWindow_->clear();
 		candidateWindow_->setUseCursor(candUseCursor_);
 		candidateWindow_->setCandPerRow(candPerRow_);
@@ -901,14 +1573,20 @@ void TextService::updateCandidates(Ime::EditSession* session) {
 		for (int i = 0; i < candidates_.size(); ++i) {
 			candidateWindow_->add(candidates_[i], selKeys_[i]);
 		}
+		// endUpdate() performs the single layout pass for this response.
 		candidateWindow_->recalculateSize();
+		candidateWindow_->endUpdate();
 		candidateWindow_->refresh();
 		markCandidateContentApplied(renderedPreedit);
 		hasAppliedCandidateCursor_ = false;
 	}
+	const ULONGLONG contentEnd = qpcMicros();
 
+	const ULONGLONG moveStart = qpcMicros();
 	moveCandidateWindowToInputRect(session, L"updateCandidates", true);
+	const ULONGLONG moveEnd = qpcMicros();
 
+	ULONGLONG showEnd = moveEnd;
 	if (showingCandidates_) {
 		candidateWindow_->Show(shouldShowCandidateWindowUI_ ? TRUE : FALSE);
 		std::wostringstream log;
@@ -916,12 +1594,27 @@ void TextService::updateCandidates(Ime::EditSession* session) {
 			<< boolText(shouldShowCandidateWindowUI_);
 		appendCandidateWindowLog(log.str());
 	}
+	showEnd = qpcMicros();
 
+	ULONGLONG uiElementEnd = showEnd;
 	if (contentChanged && validCandidateListElementId_) {
 		auto elementMgr = Ime::ComPtr<ITfUIElementMgr>::queryFrom(threadMgr());
 		if (elementMgr) {
 			elementMgr->UpdateUIElement(candidateListElementId_);
 		}
+	}
+	uiElementEnd = qpcMicros();
+	if (Ime::isTraceLoggingEnabled()) {
+		std::wostringstream timing;
+		timing << L"[TextService::updateCandidates.detail] owner_us="
+		       << (ownerEnd - fnStart)
+		       << L" content_us=" << (contentEnd - contentStart)
+		       << L" move_us=" << (moveEnd - moveStart)
+		       << L" show_us=" << (showEnd - moveEnd)
+		       << L" uielement_us=" << (uiElementEnd - showEnd)
+		       << L" total_us=" << (uiElementEnd - fnStart)
+		       << L" changed=" << boolText(contentChanged);
+		appendCandidateWindowLog(timing.str());
 	}
 }
 
@@ -996,6 +1689,7 @@ bool TextService::moveCandidateWindowToInputRect(Ime::EditSession* session, cons
 	}
 
 	RECT textRect;
+	const ULONGLONG inputStart = qpcMicros();
 	// get the position of composition area from TSF
 	if (!inputRect(session, &textRect)) {
 		std::wstring tag = L"[TextService::";
@@ -1004,6 +1698,7 @@ bool TextService::moveCandidateWindowToInputRect(Ime::EditSession* session, cons
 		appendCandidateWindowLog(tag);
 		return false;
 	}
+	const ULONGLONG inputEnd = qpcMicros();
 
 	const POINT nextPos{textRect.left, textRect.bottom};
 	const ULONGLONG now = ::GetTickCount64();
@@ -1016,6 +1711,7 @@ bool TextService::moveCandidateWindowToInputRect(Ime::EditSession* session, cons
 
 	// FIXME: where should we put the candidate window?
 	candidateWindow_->move(nextPos.x, nextPos.y);
+	const ULONGLONG moveEnd = qpcMicros();
 	hasLastCandidateWindowPos_ = true;
 	lastCandidateWindowPos_ = nextPos;
 	lastCandidateWindowMoveTick_ = now;
@@ -1024,6 +1720,14 @@ bool TextService::moveCandidateWindowToInputRect(Ime::EditSession* session, cons
 	log << L"[TextService::" << reason << L"] moved left=" << nextPos.x
 		<< L" bottom=" << nextPos.y;
 	appendCandidateWindowLog(log.str());
+	if (Ime::isTraceLoggingEnabled()) {
+		std::wostringstream timing;
+		timing << L"[TextService::" << reason << L".timing] input_us="
+		       << (inputEnd - inputStart)
+		       << L" move_us=" << (moveEnd - inputEnd)
+		       << L" total_us=" << (moveEnd - inputStart);
+		appendCandidateWindowLog(timing.str());
+	}
 	return true;
 }
 
@@ -1269,6 +1973,7 @@ bool TextService::ensureClientForCurrentProfile(const wchar_t* reason) {
 }
 
 void TextService::closeClient() {
+	stopKeyRepeat();
 	// deactive currently active language profile
 	if (client_) {
 		// disconnect from the server

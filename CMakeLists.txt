@@ -158,6 +158,13 @@ add_subdirectory("${PROJECT_SOURCE_DIR}/libuv")
 add_subdirectory("${PROJECT_SOURCE_DIR}/MoqiTextService")
 add_subdirectory("${PROJECT_SOURCE_DIR}/Preview")
 
+# Optional, appearance-only Sogou skin renderer/preview.  Disable this if you
+# want an upstream-identical build; the IME still runs unchanged either way.
+option(MOQI_BUILD_SOGOU_SKIN_PREVIEW "Build the Sogou skin render test tool" ON)
+if(MOQI_BUILD_SOGOU_SKIN_PREVIEW)
+    add_subdirectory("${PROJECT_SOURCE_DIR}/SogouSkinTools")
+endif()
+
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     add_subdirectory("${PROJECT_SOURCE_DIR}/MoqLauncher")
     add_subdirectory("${PROJECT_SOURCE_DIR}/SetupHelper")

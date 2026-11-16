@@ -81,6 +81,21 @@ static constexpr ULONGLONG LAUNCHER_KILL_RETRY_COOLDOWN_MS = 15000;
 
 namespace {
 
+unsigned long long qpcMicros() {
+  static LARGE_INTEGER frequency = [] {
+    LARGE_INTEGER value{};
+    ::QueryPerformanceFrequency(&value);
+    return value;
+  }();
+  LARGE_INTEGER counter{};
+  ::QueryPerformanceCounter(&counter);
+  if (frequency.QuadPart <= 0) {
+    return 0;
+  }
+  return static_cast<unsigned long long>(
+      (counter.QuadPart * 1000000ULL) / frequency.QuadPart);
+}
+
 bool isOrdinaryPrintableKey(Ime::KeyEvent &keyEvent) {
   const UINT charCode = keyEvent.charCode();
   if (charCode < 0x20) {
@@ -590,6 +605,54 @@ bool Client::handleRpcResponse(Json::Value &msg, Ime::EditSession *session) {
   return success;
 }
 
+bool Client::handleFilterRpcResponse(Json::Value &msg) {
+  if (!msg.get("success", false).asBool()) {
+    return false;
+  }
+  // filterKeyDown/filterKeyUp are "may I consume this key?" probes.  With
+  // Rime they never carry composition/candidate/commit state; the real state
+  // is returned by onKeyDown/onKeyUp together with an edit session.  Apply
+  // only side-band UI changes here (language buttons, preserved keys,
+  // keyboard mode, selection keys); the raw-key tracker is fed from
+  // onKeyDown so it sees the real backend state for the same key.
+  updateSelectionKeys(msg);
+  const auto &customizeUIVal = msg["customizeUI"];
+  if (customizeUIVal.isObject()) {
+    updateUI(customizeUIVal);
+  }
+  updateLanguageButtons(msg);
+  updatePreservedKeys(msg);
+  updateKeyboardStatus(msg);
+  return true;
+}
+
+bool Client::updateUModeTracker(Json::Value &msg, Ime::KeyEvent &keyEvent,
+                                bool idleBeforeKey) {
+  if (!msg.get("success", false).asBool()) {
+    return false;
+  }
+  const bool handled = msg["return"].asBool();
+  const std::wstring composition =
+      msg["compositionString"].isString()
+          ? utf8ToUtf16(msg["compositionString"].asCString())
+          : std::wstring();
+  const bool showCandidates =
+      msg["showCandidates"].isBool() && msg["showCandidates"].asBool();
+  const std::wstring commit =
+      msg["commitString"].isString()
+          ? utf8ToUtf16(msg["commitString"].asCString())
+          : std::wstring();
+  if (keyEvent.keyCode() == VK_RETURN && !uModeTracker_.rawInput().empty()) {
+    // updateCommitString() runs inside updateStatus() below; remember the raw
+    // lookup input first so the Enter commit can drop the consumed u prefix.
+    uModeCommitRaw_ = uModeTracker_.rawInput();
+  }
+  uModeTracker_.onKeyEvent(static_cast<wchar_t>(keyEvent.charCode()),
+                           keyEvent.keyCode(), handled, !composition.empty(),
+                           showCandidates, !commit.empty(), idleBeforeKey);
+  return handled;
+}
+
 void Client::updateUI(const Json::Value &data) {
   for (auto it = data.begin(); it != data.end(); ++it) {
     const char *name = it.memberName();
@@ -706,8 +769,37 @@ void Client::updateCommitString(Json::Value &msg, Ime::EditSession *session,
   const auto &commitStringVal = msg["commitString"];
   if (commitStringVal.isString()) {
     const std::wstring rawCommitString = utf8ToUtf16(commitStringVal.asCString());
+    if (!rawCommitString.empty()) {
+      uModeTracker_.reset();
+    }
     const bool autoPairQuotesEnabled = textService_->autoPairQuotes();
     std::wstring commitString = rawCommitString;
+    // In u-mode, Enter is the "temporary English word" escape.  Rime commits
+    // the raw lookup input (e.g. ushui); strip only the leading u and keep the
+    // rest of the typed word.  Chinese candidate commits do not match the raw
+    // tracked input and are left untouched.
+    const std::wstring uModeRaw = uModeCommitRaw_;
+    uModeCommitRaw_.clear();
+    auto normalizeUModeText = [](const std::wstring& text) {
+      std::wstring result;
+      result.reserve(text.size());
+      for (wchar_t ch : text) {
+        if (ch != L'\'' && ch != L' ' && ch != L'\t') {
+          result.push_back(ch);
+        }
+      }
+      return result;
+    };
+    if (!uModeRaw.empty() && uModeRaw[0] == L'u' && !commitString.empty() &&
+        commitString[0] == L'u' &&
+        normalizeUModeText(commitString) == normalizeUModeText(uModeRaw)) {
+      commitString.erase(commitString.begin());
+      while (!commitString.empty() &&
+             (commitString.front() == L'\'' || commitString.front() == L' ' ||
+              commitString.front() == L'\t')) {
+        commitString.erase(commitString.begin());
+      }
+    }
     std::wstring pairedCommitString;
     const bool isAutoPairSymbol =
         shouldAutoPairSymbol(rawCommitString, autoPairRules_, pairedCommitString);
@@ -754,15 +846,36 @@ void Client::updateCommitString(Json::Value &msg, Ime::EditSession *session,
 
 void Client::updateComposition(Json::Value &msg, Ime::EditSession *session,
                                bool &endComposition) {
+  const unsigned long long fnStart = qpcMicros();
   const auto &compositionStringVal = msg["compositionString"];
   bool emptyComposition = false;
   bool hasCompositionString = false;
   std::wstring compositionString;
+  const bool hasCandidatePayload =
+      msg["candidateList"].isArray() || msg["candidateEntries"].isArray();
+  unsigned long long preeditEnd = fnStart;
+  unsigned long long composeEnd = fnStart;
+  unsigned long long showEnd = fnStart;
+  unsigned long long updateEnd = fnStart;
+  unsigned long long moveEnd = fnStart;
+  const std::wstring uModeRaw = uModeTracker_.rawInput();
+  const bool uModeActive = !uModeRaw.empty();
   if (compositionStringVal.isString()) {
     // composition buffer
     compositionString = utf8ToUtf16(compositionStringVal.asCString());
     hasCompositionString = true;
-    textService_->setCandidatePreedit(compositionString);
+    // Candidate-window preedit only: keep the TSF composition string raw so
+    // commit/backspace/cursor semantics stay exactly as the backend expects.
+    // While a u-mode gesture is tracked the preedit is still meaningful even
+    // when Rime returns an empty composition (e.g. after deleting the radical
+    // part the backend keeps only the affix tip; some transitions briefly
+    // report nothing while the gesture is still active).
+    const std::wstring displayPreedit =
+        (compositionString.empty() && !uModeActive)
+            ? std::wstring()
+            : BuildSogouUModePreedit(uModeRaw, compositionString);
+    textService_->setCandidatePreedit(displayPreedit);
+    preeditEnd = qpcMicros();
     if (!textService_->effectiveInlinePreedit()) {
       emptyComposition = compositionString.empty();
       if (!compositionString.empty()) {
@@ -773,29 +886,61 @@ void Client::updateComposition(Json::Value &msg, Ime::EditSession *session,
         // but leave it visually empty because the preedit is rendered
         // externally in the candidate window.
         textService_->setCompositionString(session, L"", 0);
+        composeEnd = qpcMicros();
+        // The same response usually also carries a candidate list; that
+        // path calls showCandidates()/updateCandidates() once with the final
+        // preedit and candidate payload.  Calling both here as well doubled
+        // the per-key candidate update cost in WebView2 (two full passes of
+        // inputRect + layout + layered paint).
+        if (!hasCandidatePayload) {
+          textService_->showCandidates(session);
+          showEnd = qpcMicros();
+          textService_->updateCandidates(session);
+          updateEnd = qpcMicros();
+        } else if (uModeActive && !textService_->showingCandidates()) {
+          // u-mode can legitimately have zero candidates (unknown radical
+          // sequence).  Keep the preedit-only window visible instead of
+          // letting the empty candidate list hide it.
+          textService_->showCandidates(session);
+          showEnd = qpcMicros();
+          textService_->updateCandidates(session);
+          updateEnd = qpcMicros();
+        } else {
+          showEnd = composeEnd;
+          updateEnd = composeEnd;
+        }
+      }
+      if (compositionString.empty() && uModeActive &&
+          !textService_->showingCandidates()) {
+        // Backspace can leave Rime in u-mode with an empty/terse composition
+        // payload.  Keep the preedit-only window alive.
         textService_->showCandidates(session);
         textService_->updateCandidates(session);
       }
       if (textService_->hasCandidateWindow() && compositionString.empty()) {
         textService_->updateCandidatesWindow(session);
       }
+      moveEnd = qpcMicros();
       if (textService_->messageWindow_ != nullptr) {
         textService_->updateMessageWindow(session);
       }
       if (compositionString.empty() && textService_->isComposing() &&
-          !textService_->showingCandidates()) {
+          !textService_->showingCandidates() && !uModeActive) {
         textService_->setCompositionString(session, L"", 0);
         endComposition = true;
       }
     } else {
       if (compositionString.empty()) {
-        textService_->setCandidatePreedit(L"");
         emptyComposition = true;
-        if (textService_->isComposing() && !textService_->showingCandidates()) {
-          // when the composition buffer is empty and we are not showing the
-          // candidate list, end composition.
-          textService_->setCompositionString(session, L"", 0);
-          endComposition = true;
+        if (!uModeActive) {
+          textService_->setCandidatePreedit(L"");
+          if (textService_->isComposing() &&
+              !textService_->showingCandidates()) {
+            // when the composition buffer is empty and we are not showing the
+            // candidate list, end composition.
+            textService_->setCompositionString(session, L"", 0);
+            endComposition = true;
+          }
         }
       } else {
         if (!textService_->isComposing()) {
@@ -826,6 +971,18 @@ void Client::updateComposition(Json::Value &msg, Ime::EditSession *session,
     }
   }
 
+  if (Ime::isTraceLoggingEnabled() && hasCompositionString &&
+      !textService_->effectiveInlinePreedit()) {
+    std::wostringstream timing;
+    timing << L"[updateComposition.timing] preedit_us=" << (preeditEnd - fnStart)
+           << L" compose_us=" << (composeEnd - preeditEnd)
+           << L" show_us=" << (showEnd - composeEnd)
+           << L" update_us=" << (updateEnd - showEnd)
+           << L" move_us=" << (moveEnd - updateEnd)
+           << L" total_us=" << (moveEnd - fnStart);
+    appendRpcGuardLog(timing.str());
+  }
+
   const auto &compositionCursorVal = msg["compositionCursor"];
   if (compositionCursorVal.isInt()) {
     // composition cursor
@@ -837,7 +994,19 @@ void Client::updateComposition(Json::Value &msg, Ime::EditSession *session,
     }
     const int fixedCursorPos =
         utf16CursorFromCodePointCursor(compositionString, compositionCursor);
-    textService_->setCandidatePreeditCursor(fixedCursorPos);
+    int candidateCursorPos = fixedCursorPos;
+    const std::wstring &candidatePreedit = textService_->candidatePreedit();
+    const size_t suffixLength = wcslen(kSogouUModePreeditSuffix);
+    if (candidatePreedit.size() >= suffixLength &&
+        candidatePreedit.compare(candidatePreedit.size() - suffixLength,
+                                 suffixLength,
+                                 kSogouUModePreeditSuffix) == 0) {
+      // The suffix is display-only; the caret belongs before it regardless of
+      // the backend cursor offset into the raw composition.
+      candidateCursorPos =
+          static_cast<int>(candidatePreedit.size() - suffixLength);
+    }
+    textService_->setCandidatePreeditCursor(candidateCursorPos);
     if (textService_->effectiveInlinePreedit() && !emptyComposition) {
       if (!textService_->isComposing()) {
         textService_->startComposition(session->context());
@@ -851,6 +1020,7 @@ void Client::updateComposition(Json::Value &msg, Ime::EditSession *session,
 }
 
 void Client::updateLanguageButtons(Json::Value &msg) {
+  bool statusBarStateChanged = false;
   // language buttons
   const auto &addButtonVal = msg["addButton"];
   if (addButtonVal.isArray()) {
@@ -861,6 +1031,7 @@ void Client::updateLanguageButtons(Json::Value &msg) {
       if (langBtn != nullptr) {
         buttons_.emplace(langBtn->id(), langBtn); // insert into the map
         textService_->addButton(langBtn);
+        statusBarStateChanged = true;
       }
     }
   }
@@ -875,6 +1046,7 @@ void Client::updateLanguageButtons(Json::Value &msg) {
         if (map_it != buttons_.end()) {
           textService_->removeButton(map_it->second);
           buttons_.erase(map_it); // remove from the map
+          statusBarStateChanged = true;
         }
       }
     }
@@ -888,9 +1060,15 @@ void Client::updateLanguageButtons(Json::Value &msg) {
         auto map_it = buttons_.find(id);
         if (map_it != buttons_.end()) {
           map_it->second->updateFromJson(btn);
+          statusBarStateChanged = true;
         }
       }
     }
+  }
+  // Ordinary key RPCs carry no button changes; avoid polling/repainting the
+  // layered status bar for every keystroke in lightweight TSF hosts.
+  if (statusBarStateChanged) {
+    textService_->refreshSogouStatusBar();
   }
 }
 
@@ -962,9 +1140,28 @@ void Client::updateStatus(Json::Value &msg, Ime::EditSession *session) {
       updateComposition(msg, session, endComposition);
       updateCandidateList(msg, session);
     } else {
+      textService_->beginCandidateUpdate();
+      const unsigned long long listStart = qpcMicros();
       updateCandidateList(msg, session);
+      const unsigned long long listEnd = qpcMicros();
+      const unsigned long long commitStart = listEnd;
       updateCommitString(msg, session, false);
+      const unsigned long long commitEnd = qpcMicros();
       updateComposition(msg, session, endComposition);
+      textService_->endCandidateUpdate();
+      const unsigned long long compositionEnd = qpcMicros();
+      if (Ime::isTraceLoggingEnabled()) {
+        std::wostringstream timing;
+        timing << L"[updateStatus.timing] list_us=" << (listEnd - listStart)
+               << L" commit_us=" << (commitEnd - commitStart)
+               << L" composition_us=" << (compositionEnd - commitEnd)
+               << L" has_candidates="
+               << (msg["candidateList"].isArray() ||
+                           msg["candidateEntries"].isArray()
+                       ? L"true"
+                       : L"false");
+        appendRpcGuardLog(timing.str());
+      }
     }
   }
 
@@ -979,6 +1176,7 @@ void Client::updateStatus(Json::Value &msg, Ime::EditSession *session) {
 }
 
 void Client::updateCandidateList(Json::Value &msg, Ime::EditSession *session) {
+  const unsigned long long fnStart = qpcMicros();
   // handle candidate list
   const auto &showCandidatesVal = msg["showCandidates"];
   const bool hasExplicitShowCandidates = showCandidatesVal.isBool();
@@ -1024,28 +1222,67 @@ void Client::updateCandidateList(Json::Value &msg, Ime::EditSession *session) {
   const bool hasCandidateRecoveryState =
       textService_->pendingCandidateRecovery() || textService_->showingCandidates() ||
       textService_->isComposing() || !textService_->candidatePreedit().empty();
+  // A tracked u-mode gesture must keep the preedit visible even when Rime has
+  // no candidates for the current radical sequence (long/unknown input and
+  // the backspace-to-prefix state both return an empty candidate list).  A
+  // commit response ends the gesture even when this update runs before
+  // updateCommitString() (mouse selection does not pass through onKeyDown).
+  const bool hasCommitPayload =
+      msg["commitString"].isString() &&
+      !utf8ToUtf16(msg["commitString"].asCString()).empty();
+  const bool uModeActive =
+      !uModeTracker_.rawInput().empty() && !hasCommitPayload;
   const bool shouldRestoreCandidates =
       hasVisibleCandidates && hasCandidateRecoveryState &&
       (!hasExplicitShowCandidates || !explicitShowCandidates);
-  const bool shouldShowCandidates = explicitShowCandidates || shouldRestoreCandidates;
+  const bool shouldShowCandidates =
+      explicitShowCandidates || shouldRestoreCandidates || uModeActive;
 
-  if (shouldShowCandidates) {
+  const unsigned long long parseEnd = qpcMicros();
+  unsigned long long showStart = parseEnd;
+  unsigned long long showEnd = parseEnd;
+  unsigned long long updateStart = parseEnd;
+  unsigned long long updateEnd = parseEnd;
+  unsigned long long hideEnd = parseEnd;
+  if (shouldShowCandidates && !textService_->showingCandidates()) {
     // start composition if we are not composing.
     // this is required to correctly position the candidate window
     if (!textService_->isComposing()) {
       textService_->startComposition(session->context());
     }
+    showStart = qpcMicros();
     textService_->showCandidates(session);
+    showEnd = qpcMicros();
   }
 
   if (hasCandidatePayload) {
+    updateStart = qpcMicros();
     textService_->updateCandidates(session);
-    if (!hasVisibleCandidates ||
-        (hasExplicitShowCandidates && !explicitShowCandidates && !shouldRestoreCandidates)) {
+    updateEnd = qpcMicros();
+    const bool hideBecauseEmpty = !hasVisibleCandidates;
+    const bool hideBecauseExplicit =
+        hasExplicitShowCandidates && !explicitShowCandidates &&
+        !shouldRestoreCandidates;
+    if (!uModeActive && (hideBecauseEmpty || hideBecauseExplicit)) {
       textService_->hideCandidates();
     }
-  } else if (hasExplicitShowCandidates && !explicitShowCandidates) {
+    hideEnd = qpcMicros();
+  } else if (hasExplicitShowCandidates && !explicitShowCandidates &&
+             !uModeActive) {
     textService_->hideCandidates();
+    hideEnd = qpcMicros();
+  }
+
+  if (Ime::isTraceLoggingEnabled()) {
+    std::wostringstream timing;
+    timing << L"[updateCandidateList.timing] parse_us=" << (parseEnd - fnStart)
+           << L" show_us=" << (showEnd - showStart)
+           << L" update_us=" << (updateEnd - updateStart)
+           << L" hide_us=" << (hideEnd - updateEnd)
+           << L" total_us=" << (hideEnd - fnStart)
+           << L" payload=" << (hasCandidatePayload ? L"true" : L"false")
+           << L" visible=" << (hasVisibleCandidates ? L"true" : L"false");
+    appendRpcGuardLog(timing.str());
   }
 
   const auto &candidateCursorVal = msg["candidateCursor"];
@@ -1060,6 +1297,7 @@ void Client::updateCandidateList(Json::Value &msg, Ime::EditSession *session) {
 
 // handlers for the text service
 void Client::onActivate() {
+  uModeTracker_.reset();
   activationInProgress_.store(true, std::memory_order_release);
   // Use a much smaller connection budget during TSF activation. At logon the
   // system activates the default input method very early; blocking the TSF
@@ -1082,6 +1320,7 @@ void Client::onActivate() {
 }
 
 void Client::onDeactivate() {
+  uModeTracker_.reset();
   // Fire-and-forget: never block the app's TSF thread waiting for a reply to
   // a notification (e.g. when the backend is hung at boot).
   sendRpcNoWait("onDeactivate");
@@ -1110,9 +1349,20 @@ bool Client::filterKeyDown(Ime::KeyEvent &keyEvent) {
 
   Json::Value ret;
   const bool rpcOk = callRpcMethod(req, ret);
-  if (rpcOk && handleRpcResponse(ret)) {
-    return ret["return"].asBool();
+  if (rpcOk && handleFilterRpcResponse(ret)) {
+    const bool handled = ret["return"].asBool();
+    if (!handled && isOrdinaryPrintableKey(keyEvent) &&
+        !textService_->isComposing() && !textService_->showingCandidates()) {
+      // Only drop a stale gesture when the TSF side is already idle.  A
+      // printable key that Rime leaves unconsumed can still be part of an
+      // active u-mode composition (e.g. a digit while the radical lookup has
+      // no candidates), and the flags in this filter response are not
+      // authoritative.
+      uModeTracker_.reset();
+    }
+    return handled;
   }
+  uModeTracker_.reset();
   if (isOrdinaryPrintableKey(keyEvent)) {
     std::wostringstream log;
     log << L"[filterKeyDown] RPC failed or invalid response; consume printable key"
@@ -1129,14 +1379,43 @@ bool Client::onKeyDown(Ime::KeyEvent &keyEvent, Ime::EditSession *session) {
   auto req = createRpcRequest("onKeyDown");
   addKeyEventToRpcRequest(req, keyEvent);
 
+  // filterKeyDown() deliberately does not touch the TSF composition, so this
+  // is still the state from the previous key.  Only the TSF composition state
+  // decides "idle": a candidate window kept alive by recovery after a forced
+  // composition termination (focus switch, click elsewhere) can still hold
+  // the previous preedit string, and using that as an idle signal prevented
+  // the next genuine u-mode gesture from starting.
+  const bool idleBeforeKey = !textService_->isComposing();
+  const unsigned long long start = qpcMicros();
   Json::Value ret;
-  callRpcMethod(req, ret);
-  if (handleRpcResponse(ret, session)) {
+  const bool rpcOk = callRpcMethod(req, ret);
+  const unsigned long long rpcEnd = qpcMicros();
+  // Rime's filterKeyDown only decides whether to consume the key; the actual
+  // composition/candidate/commit payload is returned by onKeyDown.  Update
+  // the raw-key tracker before updateStatus() so the preedit built for this
+  // same response can already use the new key.
+  updateUModeTracker(ret, keyEvent, idleBeforeKey);
+  const bool handled = handleRpcResponse(ret, session);
+  if (!ret["commitString"].isString() ||
+      utf8ToUtf16(ret["commitString"].asCString()).empty()) {
+    uModeCommitRaw_.clear();
+  }
+  if (handled) {
     refreshAsyncPollTimer();
     flushPendingAsyncResponses(session);
-    return ret["return"].asBool();
   }
-  return false;
+  const unsigned long long end = qpcMicros();
+  if (Ime::isTraceLoggingEnabled()) {
+    std::wostringstream timing;
+    timing << L"[onKeyDown.timing] vk=" << keyEvent.keyCode()
+           << L" rpc_us=" << (rpcEnd - start)
+           << L" flush_us=" << (end - rpcEnd)
+           << L" total_us=" << (end - start)
+           << L" rpc_ok=" << (rpcOk ? L"true" : L"false")
+           << L" handled=" << (handled ? L"true" : L"false");
+    appendRpcGuardLog(timing.str());
+  }
+  return handled ? ret["return"].asBool() : false;
 }
 
 bool Client::filterKeyUp(Ime::KeyEvent &keyEvent) {
@@ -1145,7 +1424,7 @@ bool Client::filterKeyUp(Ime::KeyEvent &keyEvent) {
 
   Json::Value ret;
   callRpcMethod(req, ret);
-  if (handleRpcResponse(ret)) {
+  if (handleFilterRpcResponse(ret)) {
     return ret["return"].asBool();
   }
   return false;
@@ -1215,6 +1494,11 @@ bool Client::onPreservedKey(const GUID &guid, Ime::EditSession *session) {
     }
   }
   return false;
+}
+
+LangBarButton* Client::findButton(const std::string& id) {
+	auto it = buttons_.find(id);
+	return it == buttons_.end() ? nullptr : static_cast<LangBarButton*>(it->second);
 }
 
 bool Client::onCommand(UINT id, Ime::TextService::CommandType type) {
@@ -1354,6 +1638,7 @@ void Client::onKeyboardStatusChanged(bool opened) {
 
 // called just before current composition is terminated for doing cleanup.
 void Client::onCompositionTerminated(bool forced) {
+  uModeTracker_.reset();
   auto req = createRpcRequest("onCompositionTerminated");
   req.set_forced(forced);
 
@@ -1475,12 +1760,39 @@ bool Client::applyAsyncResponse(Json::Value &msg, Ime::EditSession *session) {
 }
 
 void Client::flushPendingAsyncResponses(Ime::EditSession *session) {
+  const unsigned long long flushStart = qpcMicros();
+  int appliedCount = 0;
   while (!pendingAsyncResponses_.empty()) {
     Json::Value msg = pendingAsyncResponses_.front();
-    if (!applyAsyncResponse(msg, session)) {
+    const unsigned long long start = qpcMicros();
+    const bool applied = applyAsyncResponse(msg, session);
+    const unsigned long long end = qpcMicros();
+    if (Ime::isTraceLoggingEnabled() && end - start >= 500) {
+      std::string keys;
+      for (const auto &name : msg.getMemberNames()) {
+        if (!keys.empty()) {
+          keys += ",";
+        }
+        keys += name;
+      }
+      std::wostringstream timing;
+      timing << L"[flushAsync.timing] us=" << (end - start)
+             << L" applied=" << (applied ? L"true" : L"false")
+             << L" keys=" << utf8ToUtf16(keys.c_str());
+      appendRpcGuardLog(timing.str());
+    }
+    if (!applied) {
       break;
     }
+    ++appliedCount;
     pendingAsyncResponses_.pop_front();
+  }
+  const unsigned long long flushEnd = qpcMicros();
+  if (Ime::isTraceLoggingEnabled() && appliedCount > 0) {
+    std::wostringstream timing;
+    timing << L"[flushAsync.total] count=" << appliedCount
+           << L" us=" << (flushEnd - flushStart);
+    appendRpcGuardLog(timing.str());
   }
 }
 
@@ -1645,6 +1957,7 @@ bool Client::callRpcPipe(HANDLE pipe, const std::string &serializedRequest,
 // a sequence number will be added to the req object automatically.
 bool Client::callRpcMethod(moqi::protocol::ClientRequest &request,
                            Json::Value &response) {
+  const unsigned long long rpcStart = qpcMicros();
   try {
     ScopedRpcInProgress rpcGuard(rpcInProgress_);
     if (shouldWaitConnection_ && !waitForRpcConnection(connectAttempts_)) {
@@ -1710,6 +2023,16 @@ bool Client::callRpcMethod(moqi::protocol::ClientRequest &request,
         resetTextServiceState(); // since we lost the connection, the state is
                                  // unknown so we reset.
       }
+    }
+    const unsigned long long rpcEnd = qpcMicros();
+    if (Ime::isTraceLoggingEnabled() && rpcEnd - rpcStart >= 3000) {
+      std::wostringstream timing;
+      timing << L"[callRpcMethod.timing] method="
+             << static_cast<int>(request.method())
+             << L" seq=" << seqNum
+             << L" total_us=" << (rpcEnd - rpcStart)
+             << L" success=" << (success ? L"true" : L"false");
+      appendRpcGuardLog(timing.str());
     }
     return success;
   } catch (const std::exception &) {
@@ -1952,6 +2275,7 @@ bool Client::completeConnectionHandshake() {
 }
 
 void Client::resetTextServiceState() {
+  uModeTracker_.reset();
   // we lost connection while being activated previously
   // re-initialize the whole text service.
 
