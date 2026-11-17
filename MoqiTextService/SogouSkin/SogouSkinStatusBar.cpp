@@ -1,4 +1,5 @@
 #include "SogouSkin.h"
+#include "DpiSupport.h"
 
 #include <windowsx.h>
 
@@ -244,11 +245,13 @@ bool StatusBarWindow::create() {
     if (!bar) {
         return false;
     }
-    width_ = static_cast<int>(bar->GetWidth());
-    height_ = static_cast<int>(bar->GetHeight());
-    if (width_ <= 0 || height_ <= 0) {
+    baseWidth_ = static_cast<int>(bar->GetWidth());
+    baseHeight_ = static_cast<int>(bar->GetHeight());
+    if (baseWidth_ <= 0 || baseHeight_ <= 0) {
         return false;
     }
+    width_ = baseWidth_;
+    height_ = baseHeight_;
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -267,6 +270,8 @@ bool StatusBarWindow::create() {
     if (!hwnd_) {
         return false;
     }
+    dpi_ = static_cast<int>(WindowDpi(hwnd_));
+    updateSizeForDpi();
     // Create hidden.  The owner (TextService) calls show() only after its TSF
     // focus event proves that this process owns the foreground; the timer then
     // keeps validating that ownership.
@@ -372,8 +377,7 @@ void StatusBarWindow::refresh() {
     graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
     graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
     graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    graphics.DrawImage(bar.get(), 0, 0, static_cast<int>(bar->GetWidth()),
-                       static_cast<int>(bar->GetHeight()));
+    graphics.DrawImage(bar.get(), 0, 0, width_, height_);
     const auto options = LoadOptions();
     const auto& items = theme_->statusBar().items;
     lastItemStates_.assign(items.size(), -1);
@@ -399,9 +403,10 @@ void StatusBarWindow::refresh() {
         }
         lastItemStates_[i] = stateIndex;
         if (auto image = theme_->image(names[stateIndex])) {
-            graphics.DrawImage(image.get(), item.pos.x, item.pos.y,
-                               static_cast<int>(image->GetWidth()),
-                               static_cast<int>(image->GetHeight()));
+            graphics.DrawImage(image.get(), scaleValue(item.pos.x),
+                               scaleValue(item.pos.y),
+                               scaleValue(static_cast<int>(image->GetWidth())),
+                               scaleValue(static_cast<int>(image->GetHeight())));
         }
     }
     SogouSkin::UpdateLayeredWindowBitmap(hwnd_, bitmap.get());
@@ -455,13 +460,10 @@ bool StatusBarWindow::setTheme(std::shared_ptr<Theme> theme) {
         return false;
     }
     theme_ = std::move(theme);
-    if (newWidth != width_ || newHeight != height_) {
-        width_ = newWidth;
-        height_ = newHeight;
-        if (hwnd_) {
-            ::SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, width_, height_,
-                           SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
-        }
+    if (newWidth != baseWidth_ || newHeight != baseHeight_) {
+        baseWidth_ = newWidth;
+        baseHeight_ = newHeight;
+        updateSizeForDpi();
     }
     hoverIndex_ = -1;
     pressedIndex_ = -1;
@@ -469,19 +471,43 @@ bool StatusBarWindow::setTheme(std::shared_ptr<Theme> theme) {
     return true;
 }
 
+void StatusBarWindow::updateSizeForDpi() {
+    width_ = scaleValue(baseWidth_);
+    height_ = scaleValue(baseHeight_);
+    if (width_ <= 0 || height_ <= 0) {
+        return;
+    }
+    if (hwnd_) {
+        ::SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, width_, height_,
+                       SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+}
+
+int StatusBarWindow::scaleValue(int value) const {
+    return ::MulDiv(value, dpi_, 96);
+}
+
 void StatusBarWindow::positionAtCorner() {
     if (!hwnd_) {
         return;
     }
     RECT work = {};
-    ::SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    MONITORINFO monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    HMONITOR monitor = ::MonitorFromWindow(hwnd_, MONITOR_DEFAULTTOPRIMARY);
+    if (monitor && ::GetMonitorInfoW(monitor, &monitorInfo)) {
+        work = monitorInfo.rcWork;
+    } else {
+        ::SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    }
     const auto options = LoadOptions();
+    const int margin = scaleValue(20);
     const int x = options.statusbarX >= 0
                       ? options.statusbarX
-                      : std::max(0, static_cast<int>(work.right) - width_ - 20);
+                      : std::max(0, static_cast<int>(work.right) - width_ - margin);
     const int y = options.statusbarY >= 0
                       ? options.statusbarY
-                      : std::max(0, static_cast<int>(work.bottom) - height_ - 20);
+                      : std::max(0, static_cast<int>(work.bottom) - height_ - margin);
     ::SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width_, height_,
                    SWP_NOACTIVATE);
 }
@@ -502,9 +528,9 @@ int StatusBarWindow::hitTest(POINT pt) const {
         if (!image) {
             continue;
         }
-        RECT rect = {item.pos.x, item.pos.y,
-                     item.pos.x + static_cast<LONG>(image->GetWidth()),
-                     item.pos.y + static_cast<LONG>(image->GetHeight())};
+        RECT rect = {scaleValue(item.pos.x), scaleValue(item.pos.y),
+                     scaleValue(item.pos.x + static_cast<int>(image->GetWidth())),
+                     scaleValue(item.pos.y + static_cast<int>(image->GetHeight()))};
         if (::PtInRect(&rect, pt)) {
             return i;
         }
@@ -581,6 +607,16 @@ LRESULT StatusBarWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT:
         paint();
         return 0;
+    case WM_DPICHANGED: {
+        const UINT newDpi = HIWORD(wp);
+        if (newDpi > 0) {
+            dpi_ = static_cast<int>(newDpi);
+            updateSizeForDpi();
+            positionAtCorner();
+            refresh();
+        }
+        return 0;
+    }
     case WM_ERASEBKGND:
         return TRUE;
     case WM_MOUSEACTIVATE:

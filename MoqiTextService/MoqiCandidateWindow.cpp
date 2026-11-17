@@ -3,6 +3,8 @@
 //
 
 #include "MoqiCandidateWindow.h"
+
+#include "SogouSkin/DpiSupport.h"
 #include "MoqiTextService.h"
 #include "SogouSkin/SogouSkin.h"
 
@@ -398,6 +400,12 @@ CandidateWindow::CandidateWindow(Ime::TextService* service, Ime::EditSession* se
     }
     const bool created = create(owner, WS_POPUP | WS_CLIPCHILDREN, exStyle);
     const DWORD createError = created ? 0 : ::GetLastError();
+    if (created && sogouRenderer_) {
+        // Resolve the effective DPI of the actual window (host awareness may be
+        // unaware/system/per-monitor-v2).  The renderer applies this as one
+        // uniform scale to the whole skin plan.
+        sogouRenderer_->setDpi(static_cast<int>(SogouSkin::WindowDpi(hwnd_)));
+    }
     const ULONGLONG createEnd = qpcMicros();
     appendSogouSkinLog(L"CandidateWindow ctor");
 
@@ -982,6 +990,17 @@ void CandidateWindow::recalculateSize() {
 
 LRESULT CandidateWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_DPICHANGED:
+        if (sogouRenderer_ && HIWORD(wp) > 0) {
+            sogouRenderer_->setDpi(static_cast<int>(HIWORD(wp)));
+            sogouRenderDirty_ = true;
+            sogouEverRendered_ = false;
+            recalculateSize();
+            ::InvalidateRect(hwnd_, nullptr, TRUE);
+        }
+        // Do not apply the suggested window rect: this is an owned popup and
+        // TextService::moveCandidateWindowToInputRect() places it at the caret.
+        return 0;
     case WM_TIMER:
         if (wp == kSogouRenderTimerId) {
             ::KillTimer(hwnd_, kSogouRenderTimerId);
@@ -1383,6 +1402,9 @@ bool CandidateWindow::hasSogouSkin() const {
 void CandidateWindow::reloadSogouSkin() {
     sogouRenderer_.reset();
     loadSogouSkin();
+    if (sogouRenderer_ && hwnd_) {
+        sogouRenderer_->setDpi(static_cast<int>(SogouSkin::WindowDpi(hwnd_)));
+    }
     sogouRenderDirty_ = true;
     sogouEverRendered_ = false;
     const bool layered = hasSogouSkin();

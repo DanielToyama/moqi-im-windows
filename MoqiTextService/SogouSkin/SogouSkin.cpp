@@ -1306,16 +1306,35 @@ std::shared_ptr<Gdiplus::Bitmap> Theme::mask(const std::wstring& name) const {
     return bitmap;
 }
 
-Renderer::Renderer(std::shared_ptr<Theme> theme) : theme_(std::move(theme)) {
+Renderer::Renderer(std::shared_ptr<Theme> theme, int dpi) : theme_(std::move(theme)), dpi_(dpi) {
     if (theme_) {
         const int baseFont = std::max(1, theme_->baseFontSize());
         const int effectiveFont = std::max(1, theme_->display().fontSize);
-        scale_ = std::clamp(static_cast<double>(effectiveFont) / baseFont,
-                            0.5, 4.0);
+        fontScale_ = std::clamp(static_cast<double>(effectiveFont) / baseFont,
+                                0.5, 4.0);
     }
+    updateScale();
 }
 
 Renderer::~Renderer() = default;
+
+void Renderer::updateScale() const {
+    const double dpiScale = static_cast<double>(dpi_ > 0 ? dpi_ : 96) / 96.0;
+    scale_ = fontScale_ * dpiScale;
+}
+
+void Renderer::setDpi(int dpi) {
+    if (dpi <= 0) {
+        dpi = 96;
+    }
+    if (dpi_ == dpi) {
+        return;
+    }
+    dpi_ = dpi;
+    updateScale();
+    // Cached background bitmaps were composed at the previous scale.
+    backgroundCache_.clear();
+}
 
 int Renderer::scaleValue(int value) const {
     return static_cast<int>(std::lround(value * scale_));
@@ -1330,9 +1349,13 @@ void Renderer::ensureFonts(HDC hdc) const {
     if (fontsReady_) {
         return;
     }
-    dpi_ = hdc ? ::GetDeviceCaps(hdc, LOGPIXELSY) : 96;
     if (dpi_ <= 0) {
-        dpi_ = 96;
+        dpi_ = hdc ? ::GetDeviceCaps(hdc, LOGPIXELSX) : 96;
+        if (dpi_ <= 0) {
+            dpi_ = 96;
+        }
+        updateScale();
+        backgroundCache_.clear();
     }
     const auto& display = theme_->display();
     ownedFamilyCh_ = LoadFontFamily(&privateFonts_, display.fontCh);
@@ -1353,8 +1376,11 @@ const Gdiplus::FontFamily* Renderer::familyFor(bool ascii) const {
 }
 
 int Renderer::fontPixelSize() const {
+    // Design-space font size.  The complete plan is scaled by scale_ at paint
+    // time, so applying the monitor DPI here as well would double-scale text
+    // while leaving skin bitmaps at 1x.
     const int baseFont = theme_ ? std::max(1, theme_->baseFontSize()) : 16;
-    return std::max(1, ::MulDiv(baseFont, dpi_, 96));
+    return baseFont;
 }
 
 std::wstring Renderer::faceFor(bool ascii) const {
@@ -1928,6 +1954,8 @@ std::shared_ptr<Gdiplus::Bitmap> Renderer::backgroundBitmap(const Plan& plan,
     key += std::to_wstring(targetWidth);
     key += L"x";
     key += std::to_wstring(targetHeight);
+    key += L"|s";
+    key += std::to_wstring(static_cast<long long>(std::lround(scale_ * 1000.0)));
     const auto cached = backgroundCache_.find(key);
     if (cached != backgroundCache_.end()) {
         return cached->second;

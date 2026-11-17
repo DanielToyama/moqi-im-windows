@@ -15,6 +15,7 @@
 #include <gdiplus.h>
 
 #include "SogouSkin.h"
+#include "DpiSupport.h"
 
 using namespace Moqi;
 
@@ -47,6 +48,7 @@ constexpr int kClientHeight = 700;
 
 bool g_offscreen = false; // --offscreen: used by the message-based UI tests.
 std::wstring g_self_test_dir; // --self-test <dir>: headless dropdown checks.
+UINT g_forced_dpi = 0; // --dpi <n>: test-only layout/rendering scale override.
 
 enum ControlId {
     IDC_SKIN_COMBO = 1001,
@@ -655,6 +657,7 @@ private:
     void destroyFonts();
     void layoutControls();
     void applyFonts();
+    void updateDpiDependentMetrics();
     int dpiScale(int value) const;
     HFONT makeFont(int pointSize, bool bold = false) const;
 
@@ -697,6 +700,8 @@ private:
     HWND groupStatus_ = nullptr;
     HWND skinCombo_ = nullptr;
     HWND browseButton_ = nullptr;
+    HWND skinLabel_ = nullptr;
+    HWND statusItemsLabel_ = nullptr;
     HWND fontSizeLabel_ = nullptr;
     HWND fontSlider_ = nullptr;
     HWND fontValue_ = nullptr;
@@ -720,6 +725,7 @@ private:
     HFONT uiFont_ = nullptr;
     HFONT boldFont_ = nullptr;
     HFONT smallFont_ = nullptr;
+    UINT dpi_ = 96;
 
     std::vector<SkinEntry> skins_;
     int skinIndex_ = -1;
@@ -752,16 +758,11 @@ private:
 };
 
 int SettingsWindow::dpiScale(int value) const {
-    HDC dc = hwnd_ ? ::GetDC(hwnd_) : nullptr;
-    const int dpi = dc ? ::GetDeviceCaps(dc, LOGPIXELSX) : 96;
-    if (dc) {
-        ::ReleaseDC(hwnd_, dc);
-    }
-    return ::MulDiv(value, dpi, 96);
+    return ::MulDiv(value, static_cast<int>(dpi_), 96);
 }
 
 HFONT SettingsWindow::makeFont(int pointSize, bool bold) const {
-    const int height = -::MulDiv(pointSize, dpiScale(96), 72);
+    const int height = -::MulDiv(pointSize, static_cast<int>(dpi_), 72);
     return ::CreateFontW(height, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL, FALSE,
                          FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -796,6 +797,18 @@ void SettingsWindow::applyFonts() {
     }
 }
 
+void SettingsWindow::updateDpiDependentMetrics() {
+    if (fontChCombo_) {
+        ::SendMessageW(fontChCombo_, CB_SETDROPPEDWIDTH, dpiScale(320), 0);
+    }
+    if (fontEnCombo_) {
+        ::SendMessageW(fontEnCombo_, CB_SETDROPPEDWIDTH, dpiScale(320), 0);
+    }
+    if (itemList_) {
+        ::SendMessageW(itemList_, LVM_SETCOLUMNWIDTH, 0, dpiScale(280));
+    }
+}
+
 bool SettingsWindow::create(HINSTANCE instance) {
     instance_ = instance;
     WNDCLASSEXW wc = {};
@@ -821,8 +834,10 @@ bool SettingsWindow::create(HINSTANCE instance) {
         return false;
     }
 
+    dpi_ = SogouSkin::SystemDpi();
     RECT desired = {0, 0, dpiScale(kClientWidth), dpiScale(kClientHeight)};
-    ::AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    SogouSkin::AdjustWindowRectForDpi(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0,
+                                      dpi_);
     const int width = desired.right - desired.left;
     const int height = desired.bottom - desired.top;
     RECT work = {};
@@ -849,10 +864,23 @@ bool SettingsWindow::create(HINSTANCE instance) {
     if (!hwnd_) {
         return false;
     }
+    dpi_ = SogouSkin::WindowDpi(hwnd_);
+    if (g_forced_dpi >= 96) {
+        // Test-only: lay the same window out at an arbitrary scale so 100/125/
+        // 150/175/200% can be verified without changing the desktop.
+        dpi_ = g_forced_dpi;
+        RECT forced = {0, 0, dpiScale(kClientWidth), dpiScale(kClientHeight)};
+        SogouSkin::AdjustWindowRectForDpi(&forced, WS_OVERLAPPEDWINDOW, FALSE, 0,
+                                          dpi_);
+        ::SetWindowPos(hwnd_, nullptr, 0, 0, forced.right - forced.left,
+                       forced.bottom - forced.top,
+                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     createControls();
     fonts_ = EnumerateInstalledFonts();
     applyFonts();
     layoutControls();
+    updateDpiDependentMetrics();
 
     // Find the skin currently used by the IME.
     std::wstring error;
@@ -903,8 +931,9 @@ void SettingsWindow::createControls() {
 
     groupSkin_ = ::CreateWindowExW(0, L"BUTTON", L"皮肤", groupStyle, 0, 0, 0, 0,
                                    hwnd_, nullptr, instance_, nullptr);
-    ::CreateWindowExW(0, L"STATIC", L"选择皮肤文件：", labelStyle, 0, 0, 0, 0, hwnd_,
-                      nullptr, instance_, nullptr);
+    skinLabel_ = ::CreateWindowExW(0, L"STATIC", L"选择皮肤文件：", labelStyle,
+                                   0, 0, 0, 0, hwnd_, nullptr, instance_,
+                                   nullptr);
     skinCombo_ = ::CreateWindowExW(
         0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST |
                                   CBS_NOINTEGRALHEIGHT | WS_VSCROLL,
@@ -984,8 +1013,9 @@ void SettingsWindow::createControls() {
         0, L"BUTTON", L"显示皮肤状态栏",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd_,
         reinterpret_cast<HMENU>(IDC_STATUSBAR), instance_, nullptr);
-    ::CreateWindowExW(0, L"STATIC", L"状态栏按钮（勾选后在皮肤上显示）：",
-                      labelStyle, 0, 0, 0, 0, hwnd_, nullptr, instance_, nullptr);
+    statusItemsLabel_ = ::CreateWindowExW(
+        0, L"STATIC", L"状态栏按钮（勾选后在皮肤上显示）：", labelStyle, 0, 0, 0,
+        0, hwnd_, nullptr, instance_, nullptr);
     itemList_ = ::CreateWindowExW(
         WS_EX_CLIENTEDGE, WC_LISTVIEWW,
         L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
@@ -1022,9 +1052,10 @@ void SettingsWindow::createControls() {
 }
 
 void SettingsWindow::layoutControls() {
-    const int s = dpiScale(1);
     auto rect = [&](int x, int y, int w, int h) {
-        return RECT{x * s, y * s, (x + w) * s, (y + h) * s};
+        // Scale the final edges, not a rounded "1 px" unit.  At 150% a
+        // dpiScale(1) prefix rounds to 2 and overflows the window by 33%.
+        return RECT{dpiScale(x), dpiScale(y), dpiScale(x + w), dpiScale(y + h)};
     };
     auto move = [](HWND control, const RECT& r) {
         if (control) {
@@ -1042,12 +1073,13 @@ void SettingsWindow::layoutControls() {
     // For CBS_DROPDOWNLIST the window height includes the drop-down list.
     // 220 logical px leaves enough room for 10 items (CB_SETMINVISIBLE=10);
     // the old 24 px clipped the list to almost nothing.
+    move(skinLabel_, rect(614, 38, 248, 18));
     move(skinCombo_, rect(614, 58, 248, 220));
     move(browseButton_, rect(868, 58, 64, 24));
-    move(fontChLabel_, rect(614, 140, 56, 20));
-    move(fontChCombo_, rect(674, 136, 258, 220));
-    move(fontEnLabel_, rect(614, 168, 56, 20));
-    move(fontEnCombo_, rect(674, 164, 258, 220));
+    move(fontChLabel_, rect(614, 140, 64, 20));
+    move(fontChCombo_, rect(680, 136, 252, 220));
+    move(fontEnLabel_, rect(614, 168, 64, 20));
+    move(fontEnCombo_, rect(680, 164, 252, 220));
     move(fontSizeLabel_, rect(614, 200, 40, 20));
     move(fontSlider_, rect(660, 196, 176, 30));
     move(fontValue_, rect(842, 199, 42, 22));
@@ -1069,6 +1101,7 @@ void SettingsWindow::layoutControls() {
     move(horizontalRadio_, rect(614, 352, 110, 22));
     move(verticalRadio_, rect(730, 352, 110, 22));
     move(statusbarCheck_, rect(614, 380, 160, 22));
+    move(statusItemsLabel_, rect(614, 406, 318, 18));
     move(itemList_, rect(614, 430, 318, 138));
 
     move(applyButton_, rect(600, 640, 78, 28));
@@ -1382,6 +1415,7 @@ void SettingsWindow::refreshPreview() {
         return;
     }
     SogouSkin::Renderer renderer(theme);
+    renderer.setDpi(static_cast<int>(dpi_));
     SogouSkin::RenderState state;
     state.preedit = L"moqi shurufa";
     state.candidates = {L"墨奇输入法", L"墨奇", L"默契", L"默祈", L"摩奇"};
@@ -2143,9 +2177,29 @@ LRESULT SettingsWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lp);
         RECT desired = {0, 0, dpiScale(kClientWidth), dpiScale(kClientHeight)};
-        ::AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
+        SogouSkin::AdjustWindowRectForDpi(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0,
+                                          dpi_);
         info->ptMinTrackSize.x = desired.right - desired.left;
         info->ptMinTrackSize.y = desired.bottom - desired.top;
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        const UINT newDpi = HIWORD(wp);
+        if (newDpi > 0) {
+            dpi_ = newDpi;
+        }
+        const RECT* suggested = reinterpret_cast<const RECT*>(lp);
+        if (suggested) {
+            ::SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
+                           suggested->right - suggested->left,
+                           suggested->bottom - suggested->top,
+                           SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+        applyFonts();
+        layoutControls();
+        updateDpiDependentMetrics();
+        ::InvalidateRect(hwnd_, nullptr, TRUE);
+        refreshPreview();
         return 0;
     }
     case WM_CTLCOLORSTATIC:
@@ -2247,11 +2301,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             } else if (_wcsicmp(argv[i], L"--self-test") == 0 && i + 1 < argc) {
                 g_self_test_dir = argv[++i];
                 g_offscreen = true;
+            } else if (_wcsicmp(argv[i], L"--dpi") == 0 && i + 1 < argc) {
+                const int dpi = _wtoi(argv[++i]);
+                if (dpi >= 96 && dpi <= 480) {
+                    g_forced_dpi = static_cast<UINT>(dpi);
+                }
             }
         }
         ::LocalFree(argv);
     }
-    ::SetProcessDPIAware();
+    // Must be set before any window is created.  The old SetProcessDPIAware()
+    // produced a system-aware process with a 96-DPI window layout, so at 150%
+    // the controls were laid out at 2x inside a 1x window and clipped.
+    SogouSkin::EnablePerMonitorDpiAwareness();
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX controls = {};
     controls.dwSize = sizeof(controls);

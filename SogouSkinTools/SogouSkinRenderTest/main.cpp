@@ -5,6 +5,13 @@
 //                       [preedit] [candidate|candidate|...]
 //                       [key-gap] [item-spacing] [text-offset-y]
 //                       [pinyin-bold 0|1] [cand-per-row] [white|transparent]
+//                       [--dpi N]
+//
+// `--dpi` defaults to 0, which derives the effective DPI from the screen DC
+// (96 in a DPI-unaware process).  Pass 120/144/168/192 to test the Windows
+// 125/150/175/200% scale factors without changing the desktop.  It is a flag
+// rather than a positional argument so it does not switch on the optional
+// [Render] override profile used by the reference-render commands.
 //
 // It deliberately creates no visible window, so it is safe to run in the
 // background while iterating.  Optional arguments let the audit harness feed
@@ -236,10 +243,26 @@ void PrintFontDebug() {
 int wmain(int argc, wchar_t** argv) {
     std::wcout.imbue(
         std::locale(std::locale::classic(), new std::codecvt_utf8<wchar_t>));
+    // Separate --dpi from the positional arguments so the historical argument
+    // order and the [Render] override path stay byte-identical at 100%.
+    std::vector<wchar_t*> positional;
+    positional.push_back(argv[0]);
+    int dpiArg = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--dpi") == 0 && i + 1 < argc) {
+            dpiArg = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else {
+            positional.push_back(argv[i]);
+        }
+    }
+    argc = static_cast<int>(positional.size());
+    argv = positional.data();
     if (argc < 4) {
         std::wcerr << L"usage: SogouSkinRenderTest <skin-dir-or-ssf> <H1|V1|H2|V2> <out.png>\n"
                       L"       [preedit] [candidate|candidate|...] [key-gap] [item-spacing]\n"
-                      L"       [text-offset-y] [pinyin-bold] [cand-per-row] [white|transparent]\n";
+                      L"       [text-offset-y] [pinyin-bold] [cand-per-row] [white|transparent]\n"
+                      L"       [--dpi 120|144|168|192]\n";
         return 2;
     }
     const std::wstring skinPath = argv[1];
@@ -299,8 +322,21 @@ int wmain(int argc, wchar_t** argv) {
             Gdiplus::GdiplusShutdown(token);
             return 1;
         }
-        const int width = static_cast<int>(bar->GetWidth());
-        const int height = static_cast<int>(bar->GetHeight());
+        const int baseWidth = static_cast<int>(bar->GetWidth());
+        const int baseHeight = static_cast<int>(bar->GetHeight());
+        int statusDpi = dpiArg;
+        if (statusDpi <= 0) {
+            HDC screen = ::GetDC(nullptr);
+            statusDpi = screen ? ::GetDeviceCaps(screen, LOGPIXELSX) : 96;
+            if (screen) {
+                ::ReleaseDC(nullptr, screen);
+            }
+        }
+        if (statusDpi <= 0) {
+            statusDpi = 96;
+        }
+        const int width = ::MulDiv(baseWidth, statusDpi, 96);
+        const int height = ::MulDiv(baseHeight, statusDpi, 96);
         Gdiplus::Bitmap target(width, height, PixelFormat32bppPARGB);
         Gdiplus::Graphics graphics(&target);
         graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
@@ -323,9 +359,10 @@ int wmain(int argc, wchar_t** argv) {
             if (!image) {
                 continue;
             }
-            graphics.DrawImage(image.get(), item.pos.x, item.pos.y,
-                               static_cast<int>(image->GetWidth()),
-                               static_cast<int>(image->GetHeight()));
+            graphics.DrawImage(image.get(), ::MulDiv(item.pos.x, statusDpi, 96),
+                               ::MulDiv(item.pos.y, statusDpi, 96),
+                               ::MulDiv(static_cast<int>(image->GetWidth()), statusDpi, 96),
+                               ::MulDiv(static_cast<int>(image->GetHeight()), statusDpi, 96));
             ++drawn;
             std::wcout << L"statusbar.item=" << item.name << L" pos=" << item.pos.x
                        << L"," << item.pos.y << L" size=" << image->GetWidth() << L"x"
@@ -359,7 +396,7 @@ int wmain(int argc, wchar_t** argv) {
                            ? candPerRowArg
                            : (Contains(schemeName, L"H") ? 3 : 1);
 
-    Moqi::SogouSkin::Renderer renderer(theme);
+    Moqi::SogouSkin::Renderer renderer(theme, dpiArg);
     HDC screen = ::GetDC(nullptr);
     const auto layout = renderer.measure(state, screen);
     ::ReleaseDC(nullptr, screen);

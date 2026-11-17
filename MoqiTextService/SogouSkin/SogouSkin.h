@@ -349,12 +349,17 @@ private:
     void showNow();
     void ensureStateTimer();
     void stopStateTimer();
+    void updateSizeForDpi();
+    int scaleValue(int value) const;
 
     std::shared_ptr<Theme> theme_;
     std::wstring windowClassName_;
     HWND hwnd_ = nullptr;
     int width_ = 0;
     int height_ = 0;
+    int baseWidth_ = 0;
+    int baseHeight_ = 0;
+    int dpi_ = 96;
     int hoverIndex_ = -1;
     int pressedIndex_ = -1;
     bool trackingMouse_ = false;
@@ -370,13 +375,22 @@ private:
 
 class Renderer {
 public:
-    explicit Renderer(std::shared_ptr<Theme> theme);
+    // `dpi` is the effective DPI of the window that will display the bitmap.
+    // Zero means "derive it from the HDC passed to measure()/paint()".  The
+    // renderer always builds its plan in the skin's design pixels and applies
+    // dpi/96 * fontScale as one uniform transform, so the 9-slice background,
+    // margins, text and hit-test rects stay in lockstep.
+    explicit Renderer(std::shared_ptr<Theme> theme, int dpi = 0);
     ~Renderer();
 
     bool valid() const { return theme_ && theme_->valid(); }
     const Theme& theme() const { return *theme_; }
-    // effectiveFontSize / Theme::baseFontSize, clamped to 0.5..4.0.
+    // (effectiveFontSize / Theme::baseFontSize) * (dpi / 96).
     double scale() const { return scale_; }
+    // Updates the target DPI (for example from WM_DPICHANGED).  Invalidates
+    // size-dependent caches; glyph metrics are DPI-independent design units.
+    void setDpi(int dpi);
+    int dpi() const { return dpi_ > 0 ? dpi_ : 96; }
 
     LayoutResult measure(const RenderState& state, HDC hdc) const;
     void paint(HDC hdc, const RECT& client, const RenderState& state) const;
@@ -451,10 +465,12 @@ private:
     std::wstring selKeyFor(size_t index, const std::wstring& keys) const;
     int scaleValue(int value) const;
     RECT scaleRect(const RECT& rect) const;
+    void updateScale() const;
 
     std::shared_ptr<Theme> theme_;
-    double scale_ = 1.0;
-    mutable int dpi_ = 96;
+    mutable double scale_ = 1.0;
+    double fontScale_ = 1.0;
+    mutable int dpi_ = 0;
     mutable bool fontsReady_ = false;
     mutable Gdiplus::PrivateFontCollection privateFonts_;
     mutable std::unique_ptr<Gdiplus::FontFamily> ownedFamilyCh_;
