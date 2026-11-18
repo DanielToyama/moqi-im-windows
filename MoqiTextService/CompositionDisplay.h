@@ -93,6 +93,68 @@ private:
     std::wstring raw_;
 };
 
+// Normalizes commit/raw-input text for comparison: Rime may add pretty
+// syllable separators that the raw tracker never saw.
+inline std::wstring NormalizeUModeCommitText(const std::wstring& text) {
+    std::wstring result;
+    result.reserve(text.size());
+    for (wchar_t ch : text) {
+        if (ch != L'\'' && ch != L' ' && ch != L'\t') {
+            result.push_back(ch);
+        }
+    }
+    return result;
+}
+
+// Resolves the text committed by Enter in a u-mode gesture.  Rime commits the
+// raw lookup input including the leading `u` consumed by affix_segmentor, so
+// the prefix is stripped only when a lookup body exists.  If the input consists
+// only of `u` characters (`u`, `uu`, `uuu`), it is a literal temporary-English
+// commit and must be kept exactly as typed.
+inline std::wstring ApplyUModeEnterCommit(const std::wstring& rawInput,
+                                          const std::wstring& commitString) {
+    if (rawInput.empty() || rawInput[0] != L'u' || commitString.empty() ||
+        commitString[0] != L'u') {
+        return commitString;
+    }
+    const std::wstring normalizedRaw = NormalizeUModeCommitText(rawInput);
+    bool onlyModePrefix = !normalizedRaw.empty();
+    for (wchar_t ch : normalizedRaw) {
+        if (ch != L'u' && ch != L'U') {
+            onlyModePrefix = false;
+            break;
+        }
+    }
+    if (normalizedRaw.size() <= 1 || onlyModePrefix) {
+        // Only `u` characters were typed.  There is no lookup body to strip:
+        // Enter must commit exactly what the user typed (`u`, `uu`, `uuu`).
+        return commitString;
+    }
+    if (NormalizeUModeCommitText(commitString) != normalizedRaw) {
+        // Chinese candidate commits (and any other backend-side rewrites) do
+        // not match the tracked raw input and are left untouched.
+        return commitString;
+    }
+    std::wstring result = commitString;
+    result.erase(result.begin());
+    while (!result.empty() &&
+           (result.front() == L'\'' || result.front() == L' ' ||
+            result.front() == L'\t')) {
+        result.erase(result.begin());
+    }
+    return result;
+}
+
+// True when the candidate window must stay visible even without candidates.
+// A non-empty backend composition (e.g. an invalid i-prefixed pinyin string)
+// still has a preedit that needs a window in external-preedit mode.  u-mode
+// additionally keeps its preedit-only window when Rime reports just the affix
+// tip.
+inline bool ShouldKeepPreeditWindow(bool hasComposition, bool externalPreedit,
+                                    bool uModeActive) {
+    return uModeActive || (hasComposition && externalPreedit);
+}
+
 // Builds the candidate-window preedit for a u-mode composition.  `rawInput`
 // is UModeInputTracker::rawInput(), including the leading u; `composition` is
 // the backend composition string (normally without the consumed u).  Returns

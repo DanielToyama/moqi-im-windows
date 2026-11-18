@@ -55,6 +55,16 @@ enum ControlId {
     IDC_SKIN_BROWSE,
     IDC_FONT_SLIDER,
     IDC_FONT_VALUE,
+    IDC_SCALE_SLIDER,
+    IDC_SCALE_VALUE,
+    IDC_LAYOUT_PREEDIT_X,
+    IDC_LAYOUT_PREEDIT_Y,
+    IDC_LAYOUT_CANDIDATE_X,
+    IDC_LAYOUT_CANDIDATE_Y,
+    IDC_LAYOUT_SPIN_PREEDIT_X,
+    IDC_LAYOUT_SPIN_PREEDIT_Y,
+    IDC_LAYOUT_SPIN_CANDIDATE_X,
+    IDC_LAYOUT_SPIN_CANDIDATE_Y,
     IDC_COLOR_PINYIN,
     IDC_COLOR_FIRST,
     IDC_COLOR_TEXT,
@@ -62,6 +72,7 @@ enum ControlId {
     IDC_HORIZONTAL,
     IDC_VERTICAL,
     IDC_STATUSBAR,
+    IDC_STATUSBAR_FULLSCREEN,
     IDC_ITEM_LIST,
     IDC_APPLY,
     IDC_OK,
@@ -106,7 +117,14 @@ bool DirectoryExists(const std::wstring& path) {
 }
 
 bool SamePath(const std::wstring& left, const std::wstring& right) {
-    return _wcsicmp(left.c_str(), right.c_str()) == 0;
+    // Recent-skin entries may use either separator style (and the settings
+    // profile root can mix them); compare canonicalized separators so the
+    // same file is never listed twice or copied onto itself.
+    auto normalize = [](std::wstring value) {
+        std::replace(value.begin(), value.end(), L'/', L'\\');
+        return value;
+    };
+    return _wcsicmp(normalize(left).c_str(), normalize(right).c_str()) == 0;
 }
 
 std::wstring TrimText(const std::wstring& value) {
@@ -670,6 +688,11 @@ private:
     std::wstring chooseDifferentFont(HWND combo, const wchar_t* preferred);
     void updateFontFaceLabel();
     void syncControlsFromState();
+    void syncLayoutEdits();
+    void syncLayoutSpins();
+    void onLayoutEditChanged(int index);
+    void onLayoutSpinDelta(int index, int delta, int position);
+    void normalizeLayoutEdit(int index);
     void updateColorButton(int index);
     void chooseColor(int index);
     void schedulePreview();
@@ -698,6 +721,7 @@ private:
     HWND groupSkin_ = nullptr;
     HWND groupFont_ = nullptr;
     HWND groupStatus_ = nullptr;
+    HWND groupFineTune_ = nullptr;
     HWND skinCombo_ = nullptr;
     HWND browseButton_ = nullptr;
     HWND skinLabel_ = nullptr;
@@ -705,6 +729,12 @@ private:
     HWND fontSizeLabel_ = nullptr;
     HWND fontSlider_ = nullptr;
     HWND fontValue_ = nullptr;
+    HWND scaleLabel_ = nullptr;
+    HWND scaleSlider_ = nullptr;
+    HWND scaleValue_ = nullptr;
+    HWND layoutLabels_[4] = {};
+    HWND layoutEdits_[4] = {};
+    HWND layoutSpins_[4] = {};
     HWND fontFaceLabel_ = nullptr;
     HWND fontChLabel_ = nullptr;
     HWND fontEnLabel_ = nullptr;
@@ -715,6 +745,7 @@ private:
     HWND horizontalRadio_ = nullptr;
     HWND verticalRadio_ = nullptr;
     HWND statusbarCheck_ = nullptr;
+    HWND statusbarFullscreenCheck_ = nullptr;
     HWND itemList_ = nullptr;
     HWND applyButton_ = nullptr;
     HWND okButton_ = nullptr;
@@ -736,12 +767,15 @@ private:
 
     int baseFontSize_ = 24;
     int fontSize_ = 24;
+    int scalePercent_ = 100;
+    SogouSkin::SkinLayout layout_;
     std::wstring fontCh_;
     std::wstring fontEn_;
     std::vector<std::wstring> fonts_;
     COLORREF colors_[kColorCount] = {};
     bool horizontal_ = false;
     bool statusbar_ = true;
+    bool statusbarFullscreenHide_ = true;
 
     std::vector<std::wstring> itemNames_;
     std::vector<bool> itemVisible_;
@@ -806,6 +840,14 @@ void SettingsWindow::updateDpiDependentMetrics() {
     }
     if (itemList_) {
         ::SendMessageW(itemList_, LVM_SETCOLUMNWIDTH, 0, dpiScale(280));
+    }
+    for (HWND edit : layoutEdits_) {
+        if (edit) {
+            // The up-down is overlaid on the edit's right edge; keep the
+            // right-aligned digits clear of the arrows at every DPI.
+            ::SendMessageW(edit, EM_SETMARGINS, EC_RIGHTMARGIN,
+                           MAKELPARAM(0, dpiScale(20)));
+        }
     }
 }
 
@@ -969,18 +1011,33 @@ void SettingsWindow::createControls() {
     ::SendMessageW(fontEnCombo_, CB_SETMINVISIBLE, 20, 0);
     ::SendMessageW(fontEnCombo_, CB_SETDROPPEDWIDTH, dpiScale(320), 0);
 
-    fontSizeLabel_ = ::CreateWindowExW(0, L"STATIC", L"字号", labelStyle, 0, 0, 0,
+    fontSizeLabel_ = ::CreateWindowExW(0, L"STATIC", L"字体大小", labelStyle, 0, 0, 0,
                                        0, hwnd_, nullptr, instance_, nullptr);
     fontSlider_ = ::CreateWindowExW(
         0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
         0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_FONT_SLIDER), instance_,
         nullptr);
-    ::SendMessageW(fontSlider_, TBM_SETRANGE, TRUE, MAKELPARAM(8, 72));
+    ::SendMessageW(fontSlider_, TBM_SETRANGE, TRUE,
+                   MAKELPARAM(SogouSkin::kMinFontSize, SogouSkin::kMaxFontSize));
     ::SendMessageW(fontSlider_, TBM_SETTICFREQ, 4, 0);
     fontValue_ = ::CreateWindowExW(0, L"STATIC", L"24", labelStyle | SS_CENTER,
                                    0, 0, 0, 0, hwnd_,
                                    reinterpret_cast<HMENU>(IDC_FONT_VALUE), instance_,
                                    nullptr);
+    scaleLabel_ = ::CreateWindowExW(0, L"STATIC", L"缩放", labelStyle, 0, 0, 0,
+                                    0, hwnd_, nullptr, instance_, nullptr);
+    scaleSlider_ = ::CreateWindowExW(
+        0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
+        0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(IDC_SCALE_SLIDER), instance_,
+        nullptr);
+    ::SendMessageW(scaleSlider_, TBM_SETRANGE, TRUE,
+                   MAKELPARAM(SogouSkin::kMinScalePercent,
+                              SogouSkin::kMaxScalePercent));
+    ::SendMessageW(scaleSlider_, TBM_SETTICFREQ, 25, 0);
+    scaleValue_ = ::CreateWindowExW(0, L"STATIC", L"100%", labelStyle | SS_CENTER,
+                                    0, 0, 0, 0, hwnd_,
+                                    reinterpret_cast<HMENU>(IDC_SCALE_VALUE),
+                                    instance_, nullptr);
     fontFaceLabel_ = ::CreateWindowExW(
         0, L"STATIC", L"", labelStyle | SS_ENDELLIPSIS, 0, 0, 0, 0, hwnd_,
         reinterpret_cast<HMENU>(IDC_FONT_FACE_LABEL), instance_, nullptr);
@@ -1013,6 +1070,10 @@ void SettingsWindow::createControls() {
         0, L"BUTTON", L"显示皮肤状态栏",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd_,
         reinterpret_cast<HMENU>(IDC_STATUSBAR), instance_, nullptr);
+    statusbarFullscreenCheck_ = ::CreateWindowExW(
+        0, L"BUTTON", L"全屏时自动隐藏状态栏",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd_,
+        reinterpret_cast<HMENU>(IDC_STATUSBAR_FULLSCREEN), instance_, nullptr);
     statusItemsLabel_ = ::CreateWindowExW(
         0, L"STATIC", L"状态栏按钮（勾选后在皮肤上显示）：", labelStyle, 0, 0, 0,
         0, hwnd_, nullptr, instance_, nullptr);
@@ -1031,6 +1092,41 @@ void SettingsWindow::createControls() {
     column.pszText = const_cast<wchar_t*>(L"状态栏按钮");
     ::SendMessageW(itemList_, LVM_INSERTCOLUMN, 0,
                    reinterpret_cast<LPARAM>(&column));
+
+    groupFineTune_ = ::CreateWindowExW(0, L"BUTTON",
+                                       L"文字位置微调（-100–100 设计像素）",
+                                       groupStyle, 0, 0, 0, 0, hwnd_, nullptr,
+                                       instance_, nullptr);
+    static const wchar_t* layoutLabels[4] = {
+        L"输入字 X", L"输入字 Y", L"候选词 X", L"候选词 Y"};
+    static const ControlId layoutIds[4] = {
+        IDC_LAYOUT_PREEDIT_X, IDC_LAYOUT_PREEDIT_Y,
+        IDC_LAYOUT_CANDIDATE_X, IDC_LAYOUT_CANDIDATE_Y};
+    static const ControlId layoutSpinIds[4] = {
+        IDC_LAYOUT_SPIN_PREEDIT_X, IDC_LAYOUT_SPIN_PREEDIT_Y,
+        IDC_LAYOUT_SPIN_CANDIDATE_X, IDC_LAYOUT_SPIN_CANDIDATE_Y};
+    for (int i = 0; i < 4; ++i) {
+        layoutLabels_[i] = ::CreateWindowExW(0, L"STATIC", layoutLabels[i],
+                                             labelStyle, 0, 0, 0, 0, hwnd_,
+                                             nullptr, instance_, nullptr);
+        layoutEdits_[i] = ::CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", L"0",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_RIGHT,
+            0, 0, 0, 0, hwnd_, reinterpret_cast<HMENU>(layoutIds[i]), instance_,
+            nullptr);
+        ::SendMessageW(layoutEdits_[i], EM_SETLIMITTEXT, 4, 0);
+        layoutSpins_[i] = ::CreateWindowExW(
+            0, UPDOWN_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | UDS_ARROWKEYS | UDS_SETBUDDYINT |
+                UDS_NOTHOUSANDS,
+            0, 0, 0, 0, hwnd_,
+            reinterpret_cast<HMENU>(layoutSpinIds[i]), instance_, nullptr);
+        ::SendMessageW(layoutSpins_[i], UDM_SETRANGE32,
+                       static_cast<WPARAM>(-100), static_cast<LPARAM>(100));
+        ::SendMessageW(layoutSpins_[i], UDM_SETBUDDY,
+                       reinterpret_cast<WPARAM>(layoutEdits_[i]), 0);
+        ::SendMessageW(layoutSpins_[i], UDM_SETPOS32, 0, 0);
+    }
 
     applyButton_ = ::CreateWindowExW(0, L"BUTTON", L"应用",
                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0,
@@ -1066,8 +1162,8 @@ void SettingsWindow::layoutControls() {
 
     move(groupPreview_, rect(14, 14, 570, 570));
     move(groupSkin_, rect(600, 14, 346, 100));
-    move(groupFont_, rect(600, 122, 346, 200));
-    move(groupStatus_, rect(600, 330, 346, 250));
+    move(groupFont_, rect(600, 122, 346, 216));
+    move(groupStatus_, rect(600, 346, 346, 250));
 
     move(preview_, rect(24, 44, 550, 520));
     // For CBS_DROPDOWNLIST the window height includes the drop-down list.
@@ -1080,35 +1176,55 @@ void SettingsWindow::layoutControls() {
     move(fontChCombo_, rect(680, 136, 252, 220));
     move(fontEnLabel_, rect(614, 168, 64, 20));
     move(fontEnCombo_, rect(680, 164, 252, 220));
-    move(fontSizeLabel_, rect(614, 200, 40, 20));
-    move(fontSlider_, rect(660, 196, 176, 30));
-    move(fontValue_, rect(842, 199, 42, 22));
-    move(fontFaceLabel_, rect(614, 226, 318, 16));
+    move(scaleLabel_, rect(614, 198, 40, 20));
+    move(scaleSlider_, rect(664, 194, 172, 28));
+    move(scaleValue_, rect(842, 197, 42, 22));
+    move(fontSizeLabel_, rect(614, 226, 50, 20));
+    move(fontSlider_, rect(664, 224, 172, 28));
+    move(fontValue_, rect(842, 227, 42, 22));
+    move(fontFaceLabel_, rect(614, 258, 318, 16));
 
     static const ControlId colorIds[kColorCount] = {
         IDC_COLOR_PINYIN, IDC_COLOR_FIRST, IDC_COLOR_TEXT, IDC_COLOR_COMMENT};
     for (int i = 0; i < kColorCount; ++i) {
         // A 2x2 grid keeps the four colour rows inside the existing group
-        // box now that the two font drop-downs occupy the first rows.
+        // box now that the two font drop-downs and two sliders occupy the
+        // first rows.
         const int column = i % 2;
         const int row = i / 2;
         const int x = 614 + column * 158;
-        const int y = 252 + row * 30;
+        const int y = 282 + row * 30;
         move(colorLabels_[i], rect(x, y, 60, 24));
         move(colorButtons_[i], rect(x + 64, y, 80, 24));
     }
 
-    move(horizontalRadio_, rect(614, 352, 110, 22));
-    move(verticalRadio_, rect(730, 352, 110, 22));
-    move(statusbarCheck_, rect(614, 380, 160, 22));
-    move(statusItemsLabel_, rect(614, 406, 318, 18));
-    move(itemList_, rect(614, 430, 318, 138));
+    move(horizontalRadio_, rect(614, 368, 110, 22));
+    move(verticalRadio_, rect(730, 368, 110, 22));
+    move(statusbarCheck_, rect(614, 396, 160, 22));
+    move(statusbarFullscreenCheck_, rect(780, 396, 166, 22));
+    move(statusItemsLabel_, rect(614, 422, 318, 18));
+    move(itemList_, rect(614, 446, 318, 138));
+
+    move(groupFineTune_, rect(14, 588, 570, 46));
+    {
+        const int labelX[4] = {26, 152, 278, 404};
+        const int labelW = 58;
+        const int editW = 64;
+        const int spinW = 16;
+        for (int i = 0; i < 4; ++i) {
+            const int editX = labelX[i] + labelW;
+            move(layoutLabels_[i], rect(labelX[i], 606, labelW, 20));
+            move(layoutEdits_[i], rect(editX, 604, editW, 23));
+            move(layoutSpins_[i],
+                 rect(editX + editW - spinW, 604, spinW, 23));
+        }
+    }
 
     move(applyButton_, rect(600, 640, 78, 28));
     move(okButton_, rect(686, 640, 78, 28));
     move(cancelButton_, rect(772, 640, 78, 28));
     move(resetButton_, rect(858, 640, 88, 28));
-    move(statusLabel_, rect(14, 592, 570, 24));
+    move(statusLabel_, rect(14, 638, 570, 22));
 }
 
 bool SettingsWindow::loadSkin(const std::wstring& path, bool useSavedOverrides,
@@ -1135,8 +1251,12 @@ bool SettingsWindow::loadSkin(const std::wstring& path, bool useSavedOverrides,
     skinPath_ = path;
     baseTheme_ = base;
     effectiveTheme_ = effective;
-    baseFontSize_ = std::max(8, base->display().fontSize);
-    fontSize_ = std::max(8, effective->display().fontSize);
+    baseFontSize_ = std::max(1, base->display().fontSize);
+    fontSize_ = std::max(1, effective->display().fontSize);
+    scalePercent_ = std::clamp(effective->display().scalePercent,
+                               SogouSkin::kMinScalePercent,
+                               SogouSkin::kMaxScalePercent);
+    layout_ = effective->layout();
     fontCh_ = effective->display().fontCh;
     fontEn_ = effective->display().fontEn;
     colors_[0] = effective->display().pinyinColor;
@@ -1147,6 +1267,7 @@ bool SettingsWindow::loadSkin(const std::wstring& path, bool useSavedOverrides,
     const auto options = SogouSkin::LoadOptions();
     horizontal_ = options.horizontal;
     statusbar_ = options.statusbar;
+    statusbarFullscreenHide_ = options.statusbarFullscreenHide;
 
     itemNames_.clear();
     itemVisible_.clear();
@@ -1292,7 +1413,8 @@ void SettingsWindow::updateFontFaceLabel() {
     const std::wstring ch = fontCh_.empty() ? L"皮肤默认" : fontCh_;
     const std::wstring en = fontEn_.empty() ? L"皮肤默认" : fontEn_;
     const std::wstring text =
-        L"当前字体：中文 " + ch + L" / 英文 " + en + L"（整窗按字号缩放）";
+        L"当前字体：中文 " + ch + L" / 英文 " + en +
+        L"（字体大小与整窗缩放相互独立）";
     ::SetWindowTextW(fontFaceLabel_, text.c_str());
 }
 
@@ -1302,6 +1424,11 @@ void SettingsWindow::syncControlsFromState() {
     wchar_t sizeText[16] = {};
     swprintf_s(sizeText, L"%d", fontSize_);
     ::SetWindowTextW(fontValue_, sizeText);
+    ::SendMessageW(scaleSlider_, TBM_SETPOS, TRUE, scalePercent_);
+    wchar_t scaleText[16] = {};
+    swprintf_s(scaleText, L"%d%%", scalePercent_);
+    ::SetWindowTextW(scaleValue_, scaleText);
+    syncLayoutEdits();
     populateFontCombo(fontChCombo_, fontCh_);
     populateFontCombo(fontEnCombo_, fontEn_);
     updateFontFaceLabel();
@@ -1314,6 +1441,94 @@ void SettingsWindow::syncControlsFromState() {
                    horizontal_ ? BST_UNCHECKED : BST_CHECKED, 0);
     ::SendMessageW(statusbarCheck_, BM_SETCHECK,
                    statusbar_ ? BST_CHECKED : BST_UNCHECKED, 0);
+    ::SendMessageW(statusbarFullscreenCheck_, BM_SETCHECK,
+                   statusbarFullscreenHide_ ? BST_CHECKED : BST_UNCHECKED, 0);
+    updatingControls_ = false;
+}
+
+void SettingsWindow::syncLayoutEdits() {
+    const int values[4] = {layout_.preeditX, layout_.preeditY,
+                           layout_.candidateX, layout_.candidateY};
+    for (int i = 0; i < 4; ++i) {
+        wchar_t text[16] = {};
+        swprintf_s(text, L"%d", values[i]);
+        ::SetWindowTextW(layoutEdits_[i], text);
+    }
+    syncLayoutSpins();
+}
+
+void SettingsWindow::syncLayoutSpins() {
+    const int values[4] = {layout_.preeditX, layout_.preeditY,
+                           layout_.candidateX, layout_.candidateY};
+    for (int i = 0; i < 4; ++i) {
+        if (layoutSpins_[i]) {
+            ::SendMessageW(layoutSpins_[i], UDM_SETPOS32, 0, values[i]);
+        }
+    }
+}
+
+void SettingsWindow::onLayoutSpinDelta(int index, int delta, int position) {
+    if (updatingControls_ || index < 0 || index >= 4) {
+        return;
+    }
+    const int clamped = std::clamp(position + delta, -100, 100);
+    int* target = nullptr;
+    switch (index) {
+    case 0: target = &layout_.preeditX; break;
+    case 1: target = &layout_.preeditY; break;
+    case 2: target = &layout_.candidateX; break;
+    default: target = &layout_.candidateY; break;
+    }
+    if (*target == clamped) {
+        return;
+    }
+    *target = clamped;
+    updatingControls_ = true;
+    wchar_t text[16] = {};
+    swprintf_s(text, L"%d", clamped);
+    ::SetWindowTextW(layoutEdits_[index], text);
+    ::SendMessageW(layoutSpins_[index], UDM_SETPOS32, 0, clamped);
+    updatingControls_ = false;
+    schedulePreview();
+}
+
+void SettingsWindow::onLayoutEditChanged(int index) {
+    if (updatingControls_ || index < 0 || index >= 4) {
+        return;
+    }
+    wchar_t text[16] = {};
+    ::GetWindowTextW(layoutEdits_[index], text, _countof(text));
+    wchar_t* end = nullptr;
+    const long value = std::wcstol(text, &end, 10);
+    if (!end || end == text || *end != L'\0') {
+        return; // intermediate "-" / empty while the user is typing
+    }
+    const int clamped = std::clamp(static_cast<int>(value), -100, 100);
+    int* target = nullptr;
+    switch (index) {
+    case 0: target = &layout_.preeditX; break;
+    case 1: target = &layout_.preeditY; break;
+    case 2: target = &layout_.candidateX; break;
+    default: target = &layout_.candidateY; break;
+    }
+    if (*target != clamped) {
+        *target = clamped;
+        schedulePreview();
+    }
+}
+
+void SettingsWindow::normalizeLayoutEdit(int index) {
+    if (index < 0 || index >= 4) {
+        return;
+    }
+    // Reformat the field so "-", empty and out-of-range input snaps back to
+    // the stored value when focus leaves.
+    updatingControls_ = true;
+    const int values[4] = {layout_.preeditX, layout_.preeditY,
+                           layout_.candidateX, layout_.candidateY};
+    wchar_t text[16] = {};
+    swprintf_s(text, L"%d", values[index]);
+    ::SetWindowTextW(layoutEdits_[index], text);
     updatingControls_ = false;
 }
 
@@ -1353,6 +1568,7 @@ void SettingsWindow::schedulePreview() {
 SogouSkin::SettingsOverrides SettingsWindow::buildSettingsValues() const {
     SogouSkin::SettingsOverrides values;
     values.fontSize = fontSize_;
+    values.scalePercent = scalePercent_;
     values.fontCh = fontCh_;
     values.fontEn = fontEn_;
     values.pinyinColor = colors_[0];
@@ -1370,10 +1586,10 @@ std::wstring SettingsWindow::buildOverridesText(int* removedLegacyKeys) const {
     if (!baseTheme_) {
         return {};
     }
-    // Font size is the only geometric value written by this UI.  The renderer
-    // derives one global scale from it and scales the whole candidate window.
-    // BuildSettingsOverridesText also migrates layout keys generated by the
-    // old per-metric UI, while preserving hand-edited advanced keys.
+    // Font size, global scale and per-skin text nudges are the geometric
+    // values written by this UI.  BuildSettingsOverridesText migrates the old
+    // combined font_size semantics and layout keys generated by the old
+    // per-metric UI, while preserving hand-edited advanced keys.
     return SogouSkin::BuildSettingsOverridesText(
         *baseTheme_, SogouSkin::OverridesPath(), buildSettingsValues(),
         removedLegacyKeys);
@@ -1414,6 +1630,9 @@ void SettingsWindow::refreshPreview() {
         ::InvalidateRect(preview_, nullptr, TRUE);
         return;
     }
+    // Layout nudges are per-skin values stored outside the override INI.  The
+    // preview uses the unsaved in-memory values so the sliders are live.
+    theme->setLayout(layout_);
     SogouSkin::Renderer renderer(theme);
     renderer.setDpi(static_cast<int>(dpi_));
     SogouSkin::RenderState state;
@@ -1735,22 +1954,32 @@ void SettingsWindow::runSelfTest() {
     RECT enItemRect = {};
     RECT sliderRect = {};
     RECT valueRect = {};
+    RECT scaleSliderRect = {};
+    RECT scaleValueRect = {};
     RECT faceRect = {};
     bool layoutOverlapOk =
         comboItemRect(fontChCombo_, &chItemRect) &&
         comboItemRect(fontEnCombo_, &enItemRect) &&
         windowRect(fontSlider_, &sliderRect) &&
         windowRect(fontValue_, &valueRect) &&
+        windowRect(scaleSlider_, &scaleSliderRect) &&
+        windowRect(scaleValue_, &scaleValueRect) &&
         windowRect(fontFaceLabel_, &faceRect);
     if (layoutOverlapOk) {
         layoutOverlapOk =
             !intersects(chItemRect, enItemRect) &&
             !intersects(chItemRect, sliderRect) &&
             !intersects(chItemRect, valueRect) &&
+            !intersects(chItemRect, scaleSliderRect) &&
+            !intersects(chItemRect, scaleValueRect) &&
             !intersects(chItemRect, faceRect) &&
             !intersects(enItemRect, sliderRect) &&
             !intersects(enItemRect, valueRect) &&
-            !intersects(enItemRect, faceRect);
+            !intersects(enItemRect, scaleSliderRect) &&
+            !intersects(enItemRect, scaleValueRect) &&
+            !intersects(enItemRect, faceRect) &&
+            !intersects(sliderRect, scaleSliderRect) &&
+            !intersects(valueRect, scaleValueRect);
         for (int i = 0; i < kColorCount && layoutOverlapOk; ++i) {
             RECT labelRect = {};
             RECT buttonRect = {};
@@ -1763,9 +1992,86 @@ void SettingsWindow::runSelfTest() {
                 !intersects(chItemRect, labelRect) &&
                 !intersects(chItemRect, buttonRect) &&
                 !intersects(enItemRect, labelRect) &&
-                !intersects(enItemRect, buttonRect);
+                !intersects(enItemRect, buttonRect) &&
+                !intersects(sliderRect, labelRect) &&
+                !intersects(sliderRect, buttonRect) &&
+                !intersects(scaleSliderRect, labelRect) &&
+                !intersects(scaleSliderRect, buttonRect);
+        }
+        // The four nudge fields and their up-down controls must fit side by
+        // side inside the fine-tune group without overlapping each other.
+        for (int i = 0; i < 4 && layoutOverlapOk; ++i) {
+            RECT editRect = {};
+            if (!windowRect(layoutEdits_[i], &editRect)) {
+                layoutOverlapOk = false;
+                break;
+            }
+            for (int j = 0; j < i; ++j) {
+                RECT otherRect = {};
+                if (!windowRect(layoutEdits_[j], &otherRect) ||
+                    intersects(otherRect, editRect)) {
+                    layoutOverlapOk = false;
+                    break;
+                }
+            }
         }
     }
+
+    bool spinOk = true;
+    for (int i = 0; i < 4; ++i) {
+        if (!layoutSpins_[i] || !layoutEdits_[i] ||
+            !::IsWindowVisible(layoutSpins_[i])) {
+            spinOk = false;
+            break;
+        }
+        const HWND buddy = reinterpret_cast<HWND>(
+            ::SendMessageW(layoutSpins_[i], UDM_GETBUDDY, 0, 0));
+        int low = 0;
+        int high = 0;
+        ::SendMessageW(layoutSpins_[i], UDM_GETRANGE32,
+                       reinterpret_cast<WPARAM>(&low),
+                       reinterpret_cast<LPARAM>(&high));
+        if (buddy != layoutEdits_[i] || low != -100 || high != 100) {
+            spinOk = false;
+            break;
+        }
+        RECT editRect = {};
+        RECT spinRect = {};
+        RECT spinLabelRect = {};
+        if (!windowRect(layoutEdits_[i], &editRect) ||
+            !windowRect(layoutSpins_[i], &spinRect) ||
+            !windowRect(layoutLabels_[i], &spinLabelRect)) {
+            spinOk = false;
+            break;
+        }
+        // UDS_ALIGNRIGHT is intentionally not used: the spin sits on the
+        // edit's right edge (inside its bounds) so it cannot collide with the
+        // neighbouring field.
+        if (spinRect.left < editRect.left ||
+            spinRect.right > editRect.right ||
+            spinRect.top < editRect.top - dpiScale(1) ||
+            spinRect.bottom > editRect.bottom + dpiScale(1)) {
+            spinOk = false;
+            break;
+        }
+        for (int j = 0; j < i; ++j) {
+            RECT otherEdit = {};
+            RECT otherLabel = {};
+            RECT otherSpin = {};
+            if (!windowRect(layoutEdits_[j], &otherEdit) ||
+                !windowRect(layoutLabels_[j], &otherLabel) ||
+                !windowRect(layoutSpins_[j], &otherSpin) ||
+                intersects(spinRect, otherEdit) ||
+                intersects(spinRect, otherLabel) ||
+                intersects(spinRect, otherSpin) ||
+                intersects(spinLabelRect, otherEdit) ||
+                intersects(spinLabelRect, otherSpin)) {
+                spinOk = false;
+                break;
+            }
+        }
+    }
+    report << L"layout_spin_ok=" << (spinOk ? 1 : 0) << L"\n";
     report << L"font_layout_overlap_ok=" << (layoutOverlapOk ? 1 : 0) << L"\n";
 
     std::wstring fontSelectedCh;
@@ -1820,6 +2126,185 @@ void SettingsWindow::runSelfTest() {
     report << L"font_apply_ok=" << (fontApplyOk ? 1 : 0) << L"\n";
     report << L"font_reload_ok=" << (fontReloadOk ? 1 : 0) << L"\n";
 
+    // ---- Independent font size / global scale / per-skin nudges --------
+    bool fontSizeIndependentOk = false;
+    bool scaleIndependentOk = false;
+    bool spinPreviewOk = false;
+    bool layoutApplyOk = false;
+    bool layoutReloadOk = false;
+    bool layoutIsolationOk = false;
+    if (fontLoaded && !skins_.empty()) {
+        std::wstring stateError;
+        loadSkin(skins_[0].path, true, &stateError);
+        // Start from zero nudges so a previous self-test run (which saves its
+        // values) cannot make the "preview changed" comparison vacuous.
+        layout_ = {};
+        scalePercent_ = 100;
+        syncLayoutEdits();
+        if (previewTimer_) {
+            ::KillTimer(hwnd_, 1);
+            previewTimer_ = 0;
+        }
+        refreshPreview();
+        const int basePreviewWidth = previewBitmapWidth_;
+        const int basePreviewHeight = previewBitmapHeight_;
+        const std::wstring basePreviewHash = previewHash();
+        const int skinBaseFont = baseFontSize_;
+        const int targetFont =
+            std::clamp(skinBaseFont + 6, SogouSkin::kMinFontSize,
+                       SogouSkin::kMaxFontSize);
+
+        auto moveSlider = [&](HWND slider, int value) {
+            ::SendMessageW(slider, TBM_SETPOS, TRUE, value);
+            ::SendMessageW(hwnd_, WM_HSCROLL,
+                           MAKEWPARAM(SB_THUMBPOSITION, value),
+                           reinterpret_cast<LPARAM>(slider));
+        };
+
+        moveSlider(fontSlider_, targetFont);
+        if (previewTimer_) {
+            ::KillTimer(hwnd_, 1);
+            previewTimer_ = 0;
+        }
+        refreshPreview();
+        const std::wstring fontHash = previewHash();
+        fontSizeIndependentOk =
+            fontSize_ == targetFont && scalePercent_ == 100 &&
+            fontHash != basePreviewHash && previewBitmapWidth_ > 0 &&
+            previewBitmapHeight_ > 0;
+        report << L"independent_font_size=" << fontSize_
+               << L" scale=" << scalePercent_
+               << L" preview=" << previewBitmapWidth_ << L"x"
+               << previewBitmapHeight_ << L"\n";
+
+        moveSlider(fontSlider_, skinBaseFont);
+        moveSlider(scaleSlider_, 150);
+        if (previewTimer_) {
+            ::KillTimer(hwnd_, 1);
+            previewTimer_ = 0;
+        }
+        refreshPreview();
+        const int scaledWidth = previewBitmapWidth_;
+        const int scaledHeight = previewBitmapHeight_;
+        scaleIndependentOk =
+            fontSize_ == skinBaseFont && scalePercent_ == 150 &&
+            scaledWidth >= basePreviewWidth * 3 / 2 - 2 &&
+            scaledHeight >= basePreviewHeight * 3 / 2 - 2;
+        report << L"independent_scale=" << scalePercent_
+               << L" preview=" << scaledWidth << L"x" << scaledHeight
+               << L" base=" << basePreviewWidth << L"x" << basePreviewHeight
+               << L"\n";
+
+        moveSlider(scaleSlider_, 100);
+        ::SetWindowTextW(layoutEdits_[0], L"20");
+        ::SendMessageW(hwnd_, WM_COMMAND,
+                       MAKEWPARAM(IDC_LAYOUT_PREEDIT_X, EN_CHANGE),
+                       reinterpret_cast<LPARAM>(layoutEdits_[0]));
+        ::SetWindowTextW(layoutEdits_[3], L"-15");
+        ::SendMessageW(hwnd_, WM_COMMAND,
+                       MAKEWPARAM(IDC_LAYOUT_CANDIDATE_Y, EN_CHANGE),
+                       reinterpret_cast<LPARAM>(layoutEdits_[3]));
+        if (previewTimer_) {
+            ::KillTimer(hwnd_, 1);
+            previewTimer_ = 0;
+        }
+        refreshPreview();
+        const std::wstring layoutHash = previewHash();
+        const bool layoutPreviewOk =
+            layout_.preeditX == 20 && layout_.candidateY == -15 &&
+            layoutHash != basePreviewHash;
+
+        // Drive the Candidate X spinner exactly like an arrow click/keypress:
+        // UDN_DELTAPOS is what the control sends before applying iDelta.
+        const int spinBefore = layout_.candidateX;
+        NMUPDOWN spinUpdate = {};
+        spinUpdate.hdr.hwndFrom = layoutSpins_[2];
+        spinUpdate.hdr.idFrom = IDC_LAYOUT_SPIN_CANDIDATE_X;
+        spinUpdate.hdr.code = UDN_DELTAPOS;
+        spinUpdate.iPos = spinBefore;
+        spinUpdate.iDelta = 1;
+        ::SendMessageW(hwnd_, WM_NOTIFY, spinUpdate.hdr.idFrom,
+                       reinterpret_cast<LPARAM>(&spinUpdate));
+        ::SendMessageW(layoutSpins_[2], UDM_SETPOS32, 0, layout_.candidateX);
+        if (previewTimer_) {
+            ::KillTimer(hwnd_, 1);
+            previewTimer_ = 0;
+        }
+        refreshPreview();
+        spinPreviewOk = layout_.candidateX == spinBefore + 1 &&
+                        previewHash() != layoutHash;
+        report << L"layout_spin_preview=" << (spinPreviewOk ? 1 : 0)
+               << L" candidate_x=" << layout_.candidateX << L"\n";
+
+        const bool layoutApplied = apply(false);
+        std::vector<unsigned char> layoutBytes;
+        const std::wstring layoutText =
+            ReadAllBytes(SogouSkin::SkinLayoutsPath(), &layoutBytes)
+                ? DecodeTextBytes(layoutBytes)
+                : std::wstring();
+        const bool layoutTextOk =
+            layoutText.find(L"preedit_x=20") != std::wstring::npos &&
+            layoutText.find(L"candidate_y=-15") != std::wstring::npos &&
+            layoutText.find(L"candidate_x=1") != std::wstring::npos;
+        layoutApplyOk =
+            layoutApplied && layoutPreviewOk && layoutTextOk;
+        wchar_t applyStatus[256] = {};
+        ::GetWindowTextW(statusLabel_, applyStatus, _countof(applyStatus));
+        report << L"layout_applied=" << (layoutApplied ? 1 : 0)
+               << L" layout_preview_ok=" << (layoutPreviewOk ? 1 : 0)
+               << L" layout_text_ok=" << (layoutTextOk ? 1 : 0)
+               << L" apply_status=" << applyStatus << L"\n";
+
+        std::wstring reloadError;
+        auto reloaded = SogouSkin::LoadThemeWithOverrides(
+            skins_[0].path, SogouSkin::OverridesPath(), &reloadError);
+        layoutReloadOk =
+            reloaded && reloaded->display().scalePercent == 100 &&
+            reloaded->layout().preeditX == 20 &&
+            reloaded->layout().candidateX == 1 &&
+            reloaded->layout().candidateY == -15;
+        report << L"layout_apply_ok=" << (layoutApplyOk ? 1 : 0) << L"\n";
+        report << L"layout_reload_ok=" << (layoutReloadOk ? 1 : 0) << L"\n";
+
+        // Pick a *different* skin id, not merely the second path or a
+        // different preview: the installed copy and the original .ssf can be
+        // byte-identical and therefore intentionally share the same per-skin
+        // layout section.
+        int otherIndex = -1;
+        const std::wstring firstSkinId =
+            baseTheme_ ? baseTheme_->skinId() : std::wstring();
+        for (int i = 1; i < static_cast<int>(skins_.size()); ++i) {
+            std::wstring otherSkinError;
+            auto otherSkin =
+                SogouSkin::Theme::Load(skins_[i].path, &otherSkinError);
+            if (otherSkin && !otherSkin->skinId().empty() &&
+                otherSkin->skinId() != firstSkinId) {
+                otherIndex = i;
+                break;
+            }
+        }
+        if (otherIndex >= 0) {
+            std::wstring otherError;
+            const bool otherLoaded =
+                loadSkin(skins_[otherIndex].path, false, &otherError);
+            layoutIsolationOk =
+                otherLoaded && layout_.preeditX == 0 && layout_.preeditY == 0 &&
+                layout_.candidateX == 0 && layout_.candidateY == 0;
+            if (otherLoaded) {
+                loadSkin(skins_[0].path, true, &otherError);
+                layoutIsolationOk =
+                    layoutIsolationOk && layout_.preeditX == 20 &&
+                    layout_.candidateX == 1 && layout_.candidateY == -15;
+            }
+        }
+        report << L"layout_isolation_ok=" << (layoutIsolationOk ? 1 : 0)
+               << L"\n";
+    }
+    report << L"font_size_independent_ok="
+           << (fontSizeIndependentOk ? 1 : 0) << L"\n";
+    report << L"scale_independent_ok=" << (scaleIndependentOk ? 1 : 0)
+           << L"\n";
+
     size_t distinct = 0;
     for (size_t i = 0; i < signatures.size(); ++i) {
         if (std::find(signatures.begin(), signatures.begin() + i,
@@ -1830,13 +2315,15 @@ void SettingsWindow::runSelfTest() {
     const bool pass =
         skins_.size() >= 2 && distinct >= 2 && capacityOk && recentOk &&
         fontLoaded && fontPreviewChanged && fontApplyOk && fontReloadOk &&
-        fontDropdownOk && layoutOverlapOk;
+        fontDropdownOk && layoutOverlapOk && spinOk &&
+        fontSizeIndependentOk && scaleIndependentOk && spinPreviewOk &&
+        layoutApplyOk && layoutReloadOk && layoutIsolationOk;
     report << L"distinct_previews=" << distinct << L"\n";
     report << L"capacity_ok=" << (capacityOk ? 1 : 0) << L"\n";
     report << L"recent_apply_ok=" << (recentOk ? 1 : 0) << L"\n";
     report << L"font_test_ok="
            << ((fontLoaded && fontPreviewChanged && fontApplyOk &&
-                fontReloadOk && fontDropdownOk && layoutOverlapOk)
+                fontReloadOk && fontDropdownOk && layoutOverlapOk && spinOk)
                    ? 1
                    : 0)
            << L"\n";
@@ -1852,8 +2339,11 @@ void SettingsWindow::resetToDefaults() {
         return;
     }
     fontSize_ = baseFontSize_;
+    scalePercent_ = 100;
+    layout_ = {};
     fontCh_ = baseTheme_->display().fontCh;
     fontEn_ = baseTheme_->display().fontEn;
+    statusbarFullscreenHide_ = true;
     colors_[0] = baseTheme_->display().pinyinColor;
     colors_[1] = baseTheme_->display().firstColor;
     colors_[2] = baseTheme_->display().textColor;
@@ -1889,6 +2379,14 @@ bool SettingsWindow::saveOptions() const {
     out << L"statusbar=" << (statusbar_ ? 1 : 0) << L"\n";
     out << L"horizontal=" << (horizontal_ ? 1 : 0) << L"\n";
     out << L"key_repeat=" << (current.keyRepeat ? 1 : 0) << L"\n";
+    out << L"statusbar_fullscreen_hide="
+        << (statusbarFullscreenHide_ ? 1 : 0) << L"\n";
+    out << L"statusbar_fullscreen_scope="
+        << (current.statusbarFullscreenScope ==
+                    SogouSkin::FullscreenScope::All
+                ? L"all"
+                : L"monitor")
+        << L"\n";
     out << L"statusbar_hide=\n";
     if (current.statusbarX >= 0) {
         out << L"statusbar_x=" << current.statusbarX << L"\n";
@@ -1940,6 +2438,11 @@ bool SettingsWindow::apply(bool closeAfter) {
         setStatus(L"写入皮肤覆盖配置失败。");
         return false;
     }
+    if (baseTheme_ &&
+        !SogouSkin::SaveSkinLayoutOffsets(baseTheme_->skinId(), layout_)) {
+        setStatus(L"写入皮肤文字微调配置失败。");
+        return false;
+    }
     if (!saveOptions()) {
         setStatus(L"写入显示选项失败。");
         return false;
@@ -1947,10 +2450,10 @@ bool SettingsWindow::apply(bool closeAfter) {
 
     ::PostMessageW(HWND_BROADCAST, SogouSkin::WM_MOQI_SOGOU_SETTINGS_CHANGED, 0, 0);
     if (removedLegacyKeys > 0) {
-        setStatus(L"已应用，整窗按字号比例缩放；已迁移 " +
+        setStatus(L"已应用字体大小/缩放/文字微调；已迁移 " +
                   std::to_wstring(removedLegacyKeys) + L" 个旧版布局键。");
     } else {
-        setStatus(L"已应用，整窗按字号比例缩放，输入法会立即刷新。");
+        setStatus(L"已应用字体大小/缩放/文字微调，输入法会立即刷新。");
     }
     if (closeAfter) {
         ::DestroyWindow(hwnd_);
@@ -2020,6 +2523,16 @@ void SettingsWindow::onHScroll(HWND control, int code) {
             wchar_t text[16] = {};
             swprintf_s(text, L"%d", fontSize_);
             ::SetWindowTextW(fontValue_, text);
+            schedulePreview();
+        }
+    } else if (control == scaleSlider_) {
+        const int position =
+            static_cast<int>(::SendMessageW(scaleSlider_, TBM_GETPOS, 0, 0));
+        if (position != scalePercent_) {
+            scalePercent_ = position;
+            wchar_t text[16] = {};
+            swprintf_s(text, L"%d%%", scalePercent_);
+            ::SetWindowTextW(scaleValue_, text);
             schedulePreview();
         }
     }
@@ -2096,6 +2609,15 @@ void SettingsWindow::onCommand(WORD id, WORD notify) {
         }
         return;
     }
+    if (id >= IDC_LAYOUT_PREEDIT_X && id <= IDC_LAYOUT_CANDIDATE_Y) {
+        const int index = static_cast<int>(id - IDC_LAYOUT_PREEDIT_X);
+        if (notify == EN_CHANGE) {
+            onLayoutEditChanged(index);
+        } else if (notify == EN_KILLFOCUS) {
+            normalizeLayoutEdit(index);
+        }
+        return;
+    }
     if (id >= IDC_COLOR_PINYIN && id <= IDC_COLOR_COMMENT && notify == BN_CLICKED) {
         chooseColor(id - IDC_COLOR_PINYIN);
         return;
@@ -2112,6 +2634,12 @@ void SettingsWindow::onCommand(WORD id, WORD notify) {
     }
     if (id == IDC_STATUSBAR && notify == BN_CLICKED) {
         statusbar_ = ::SendMessageW(statusbarCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        return;
+    }
+    if (id == IDC_STATUSBAR_FULLSCREEN && notify == BN_CLICKED) {
+        statusbarFullscreenHide_ =
+            ::SendMessageW(statusbarFullscreenCheck_, BM_GETCHECK, 0, 0) ==
+            BST_CHECKED;
         return;
     }
     if (id == IDC_RESET && notify == BN_CLICKED) {
@@ -2145,6 +2673,17 @@ LRESULT SettingsWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
         if (header && header->idFrom == IDC_ITEM_LIST &&
             header->code == LVN_ITEMCHANGED) {
             onListItemChanged(reinterpret_cast<NMLISTVIEW*>(lp));
+        } else if (header && header->code == UDN_DELTAPOS) {
+            static const ControlId spinIds[4] = {
+                IDC_LAYOUT_SPIN_PREEDIT_X, IDC_LAYOUT_SPIN_PREEDIT_Y,
+                IDC_LAYOUT_SPIN_CANDIDATE_X, IDC_LAYOUT_SPIN_CANDIDATE_Y};
+            for (int i = 0; i < 4; ++i) {
+                if (header->idFrom == spinIds[i]) {
+                    const auto* update = reinterpret_cast<NMUPDOWN*>(lp);
+                    onLayoutSpinDelta(i, update->iDelta, update->iPos);
+                    break;
+                }
+            }
         }
         return 0;
     }
@@ -2317,7 +2856,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX controls = {};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
+    controls.dwICC = ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES |
+                     ICC_BAR_CLASSES | ICC_UPDOWN_CLASS;
     ::InitCommonControlsEx(&controls);
 
     ULONG_PTR gdiplusToken = 0;

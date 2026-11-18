@@ -8,6 +8,8 @@
 //
 #pragma once
 
+#include "SogouSkinFullscreen.h"
+
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -52,6 +54,12 @@ struct Scheme {
     int anchorY = 0;
 };
 
+// Limits shared by the settings UI, renderer and migration code.
+inline constexpr int kMinFontSize = 8;
+inline constexpr int kMaxFontSize = 72;
+inline constexpr int kMinScalePercent = 50;
+inline constexpr int kMaxScalePercent = 300;
+
 struct Display {
     // Skins that do not specify [Display] font_ch used to fall back to SimSun
     // (宋体), which looks dated and has poor ClearType coverage.  A sans-serif
@@ -59,7 +67,13 @@ struct Display {
     // font_ch/font_en values still win (see loadIni()).
     std::wstring fontCh = L"微软雅黑";
     std::wstring fontEn = L"Arial";
+    // Effective text size in skin design pixels.  It changes glyph metrics and
+    // the layout needed to fit the text, but it no longer scales the 9-slice
+    // background or the skin margins.
     int fontSize = 16;
+    // Whole-skin scale in percent (100 = the skin's native size).  This is the
+    // value the old [Display] font_size used to drive implicitly.
+    int scalePercent = 100;
     COLORREF pinyinColor = RGB(0, 0, 0);
     COLORREF firstColor = RGB(0, 0, 0);
     COLORREF textColor = RGB(0, 0, 0);
@@ -124,6 +138,16 @@ struct LayoutResult {
     POINT anchor = {0, 0};
 };
 
+// Per-skin text placement nudges in skin design pixels.  Positive X moves
+// right and positive Y moves down.  Values are clamped to +/-100.  They only
+// translate the text/click rects; the 9-slice background stays anchored.
+struct SkinLayout {
+    int preeditX = 0;
+    int preeditY = 0;
+    int candidateX = 0;
+    int candidateY = 0;
+};
+
 class Theme;
 
 // Values owned by the native settings UI.  BuildSettingsOverridesText merges
@@ -131,6 +155,7 @@ class Theme;
 // strips layout values produced by the old per-metric font scaling.
 struct SettingsOverrides {
     int fontSize = 16;
+    int scalePercent = 100;
     // Empty means "keep the skin's own font_ch/font_en".
     std::wstring fontCh;
     std::wstring fontEn;
@@ -142,9 +167,10 @@ struct SettingsOverrides {
 };
 
 // Rewrites the override INI for the settings UI.  Existing files written by
-// the old UI (no [MoqiOverrides] marker) are migrated by dropping layout keys
-// that exactly match base value * font-size ratio.  User-edited advanced keys
-// are preserved.  Returns the complete UTF-16 text (without BOM).
+// the old UI (no [MoqiOverrides] marker, or version < 3) are migrated: old
+// font_size values are folded into the new scale field, and layout keys that
+// exactly match base value * font-size ratio are dropped.  User-edited
+// advanced keys are preserved.  Returns the complete UTF-16 text (without BOM).
 std::wstring BuildSettingsOverridesText(const Theme& baseTheme,
                                         const std::wstring& existingPath,
                                         const SettingsOverrides& values,
@@ -156,6 +182,11 @@ struct Options {
     // Long-press key auto-repeat accelerator (letters/backspace).  Read from
     // %APPDATA%\Moqi\sogou_skin_options.ini key_repeat=0/1.
     bool keyRepeat = true;
+    // Hide the status bar while the foreground window is genuinely
+    // fullscreen.  statusbar_fullscreen_scope controls whether only the
+    // covered monitor or every monitor is hidden.
+    bool statusbarFullscreenHide = true;
+    FullscreenScope statusbarFullscreenScope = FullscreenScope::Monitor;
     std::vector<std::wstring> hiddenStatusItems;
     int statusbarX = -1;
     int statusbarY = -1;
@@ -168,6 +199,19 @@ std::wstring ConfigDirectory();
 std::wstring OverridesPath();
 std::wstring OptionsPath();
 std::wstring InstalledSkinPath();
+// Per-skin text placement nudges:
+// %APPDATA%\Moqi\sogou_skin_layouts.ini
+std::wstring SkinLayoutsPath();
+
+// Reads/writes one [skin_<hash>] section.  The id is derived from the skin
+// content: archives hash their bytes, extracted directories hash skin.ini plus
+// the relative asset inventory.  In both cases the installed %APPDATA% copy
+// keeps the same id as the file/directory selected in the settings preview.
+SkinLayout LoadSkinLayoutOffsets(const std::wstring& skinId);
+std::wstring BuildSkinLayoutsText(const std::wstring& existingPath,
+                                  const std::wstring& skinId,
+                                  const SkinLayout& layout);
+bool SaveSkinLayoutOffsets(const std::wstring& skinId, const SkinLayout& layout);
 
 // Broadcast after the settings UI writes skin files.  Every live status bar
 // window receives it and asks its TextService to reload the skin in place.
@@ -206,6 +250,7 @@ public:
         None,        // no visibility change
         Show,        // make the window visible
         Hide,        // hide it and stop the timer
+        Suppress,    // hide for fullscreen, keep showRequested and polling
         StopPolling, // stay hidden and stop the timer
     };
 
@@ -221,12 +266,25 @@ public:
     // foreground window already belongs to this process the caller should show
     // immediately; otherwise the request stays pending for a short grace
     // period because TSF can deliver focus before SetForegroundWindow settles.
-    Action requestShow(HWND foreground, ULONGLONG now);
+    // `fullscreen` suppresses the show but keeps the request alive so the bar
+    // returns when the fullscreen app is left without another TSF focus event.
+    Action requestShow(HWND foreground, bool fullscreen, ULONGLONG now);
+
+    // Compatibility overload for callers that do not have a fullscreen sample.
+    Action requestShow(HWND foreground, ULONGLONG now) {
+        return requestShow(foreground, false, now);
+    }
 
     // Called from the status bar timer.  `visible` is the current window
     // visibility.  Returns Hide as soon as the foreground belongs to another
-    // process, and StopPolling once a pending show has expired.
-    Action evaluate(HWND foreground, bool visible, ULONGLONG now);
+    // process, Suppress while the owned foreground is fullscreen, and
+    // StopPolling once a pending show has expired.
+    Action evaluate(HWND foreground, bool fullscreen, bool visible,
+                    ULONGLONG now);
+
+    Action evaluate(HWND foreground, bool visible, ULONGLONG now) {
+        return evaluate(foreground, false, visible, now);
+    }
 
     void clear();
 
@@ -234,6 +292,7 @@ private:
     DWORD ownerProcessId_;
     ULONGLONG pendingGraceMs_;
     bool showRequested_ = false;
+    bool suppressed_ = false;
     ULONGLONG pendingDeadline_ = 0;
 };
 
@@ -265,6 +324,13 @@ public:
     // [Display] font_size from the skin itself, before override merging.
     int baseFontSize() const { return baseFontSize_; }
     const RenderSettings& render() const { return render_; }
+    // Per-skin text placement, loaded from sogou_skin_layouts.ini.
+    const SkinLayout& layout() const { return layout_; }
+    // Used by the settings preview to apply unsaved nudges without touching
+    // the live layouts file.
+    void setLayout(const SkinLayout& layout);
+    // Stable section id ("skin_<16 hex>") derived from the skin.ini bytes.
+    const std::wstring& skinId() const { return skinId_; }
     const Scheme* scheme(const std::wstring& name) const;
     const Scheme* chooseScheme(bool horizontal) const;
     const StatusBar& statusBar() const { return statusBar_; }
@@ -281,6 +347,7 @@ private:
     bool loadFromDirectory(const std::wstring& dir, std::wstring* error);
     bool loadFromArchive(const std::wstring& file, std::wstring* error);
     bool loadIni(const std::wstring& text, std::wstring* error);
+    void loadLayoutOffsets();
     void parseScheme(const std::map<std::wstring, std::wstring>& section,
                      const std::wstring& name, Scheme* scheme);
 
@@ -289,6 +356,8 @@ private:
     int baseFontSize_ = 16;
     Display display_;
     RenderSettings render_;
+    SkinLayout layout_;
+    std::wstring skinId_;
     std::map<std::wstring, Scheme> schemes_;
     StatusBar statusBar_;
     std::wstring baseDir_;
@@ -347,6 +416,10 @@ private:
     void positionAtCorner();
     bool collectItemStates(std::vector<int>* states) const;
     void showNow();
+    void suppressForFullscreen();
+    void refreshFullscreenOptions();
+    bool sampleFullscreen(HWND foreground, bool force);
+    void setStateTimerInterval(UINT intervalMs);
     void ensureStateTimer();
     void stopStateTimer();
     void updateSizeForDpi();
@@ -364,6 +437,10 @@ private:
     int pressedIndex_ = -1;
     bool trackingMouse_ = false;
     UINT_PTR stateTimer_ = 0;
+    UINT stateTimerIntervalMs_ = 150;
+    bool fullscreenHideEnabled_ = true;
+    FullscreenScope fullscreenScope_ = FullscreenScope::Monitor;
+    StatusBarFullscreenDetector fullscreenDetector_;
     StatusBarForegroundPolicy foregroundPolicy_;
     std::vector<int> lastItemStates_;
     ItemClickHandler onItemClick_;
@@ -377,16 +454,20 @@ class Renderer {
 public:
     // `dpi` is the effective DPI of the window that will display the bitmap.
     // Zero means "derive it from the HDC passed to measure()/paint()".  The
-    // renderer always builds its plan in the skin's design pixels and applies
-    // dpi/96 * fontScale as one uniform transform, so the 9-slice background,
-    // margins, text and hit-test rects stay in lockstep.
+    // renderer builds its plan in the skin's design pixels: text is measured
+    // with Display::fontSize while the whole plan is transformed by
+    // (Display::scalePercent / 100) * (dpi / 96).  Font size therefore changes
+    // text/layout growth only; the 9-slice background and margins are not
+    // multiplied by the font ratio.
     explicit Renderer(std::shared_ptr<Theme> theme, int dpi = 0);
     ~Renderer();
 
     bool valid() const { return theme_ && theme_->valid(); }
     const Theme& theme() const { return *theme_; }
-    // (effectiveFontSize / Theme::baseFontSize) * (dpi / 96).
+    // (scalePercent / 100) * (dpi / 96).
     double scale() const { return scale_; }
+    // Effective glyph size in design pixels (not multiplied by DPI/scale).
+    int designFontPixelSize() const { return fontPixelSize_; }
     // Updates the target DPI (for example from WM_DPICHANGED).  Invalidates
     // size-dependent caches; glyph metrics are DPI-independent design units.
     void setDpi(int dpi);
@@ -437,6 +518,7 @@ private:
     };
 
     Plan buildPlan(HDC hdc, const RenderState& state) const;
+    void applyTextOffsets(Plan* plan) const;
     void paintPlan(HDC hdc, const RECT& client, const RenderState& state,
                    const Plan& plan) const;
     void paintPlanGdiplus(Gdiplus::Graphics& graphics, const RenderState& state,
@@ -469,7 +551,8 @@ private:
 
     std::shared_ptr<Theme> theme_;
     mutable double scale_ = 1.0;
-    double fontScale_ = 1.0;
+    int fontPixelSize_ = 16;
+    int scalePercent_ = 100;
     mutable int dpi_ = 0;
     mutable bool fontsReady_ = false;
     mutable Gdiplus::PrivateFontCollection privateFonts_;

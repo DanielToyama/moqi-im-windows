@@ -9,6 +9,7 @@ set(MINIZ_DIR "${SOGOU_SKIN_DIR}/third_party/miniz")
 
 add_library(SogouSkin STATIC
     "${SOGOU_SKIN_DIR}/SogouSkin.cpp"
+    "${SOGOU_SKIN_DIR}/SogouSkinFullscreen.cpp"
     "${SOGOU_SKIN_DIR}/SogouSkinStatusBar.cpp"
     "${MINIZ_DIR}/miniz.c"
     "${MINIZ_DIR}/miniz_tdef.c"
@@ -17,6 +18,7 @@ add_library(SogouSkin STATIC
 )
 target_include_directories(SogouSkin PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/../MoqiTextService"
+    "${SOGOU_SKIN_DIR}"
     "${MINIZ_DIR}"
 )
 target_compile_definitions(SogouSkin PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -26,7 +28,7 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:char8_t->
     )
 endif()
-target_link_libraries(SogouSkin PUBLIC gdiplus shlwapi user32 gdi32)
+target_link_libraries(SogouSkin PUBLIC gdiplus shlwapi user32 gdi32 shell32 dwmapi)
 
 add_executable(SogouSkinRenderTest
     SogouSkinRenderTest/main.cpp

@@ -1,5 +1,6 @@
 add_library(MoqiSogouSkin STATIC
     SogouSkin.cpp
+    SogouSkinFullscreen.cpp
     SogouSkinStatusBar.cpp
     third_party/miniz/miniz.c
     third_party/miniz/miniz_tdef.c
@@ -29,4 +30,6 @@ endif()
 target_link_libraries(MoqiSogouSkin PUBLIC
     gdiplus
     shlwapi
+    shell32
+    dwmapi
 )

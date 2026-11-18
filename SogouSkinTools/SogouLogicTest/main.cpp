@@ -16,7 +16,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -42,7 +44,8 @@ LRESULT CALLBACK TestWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return ::DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-HWND CreateTestWindow(const wchar_t* title, HWND parent, DWORD style) {
+HWND CreateTestWindow(const wchar_t* title, HWND parent, DWORD style,
+                      DWORD exStyle = 0) {
     static const wchar_t kClass[] = L"MoqiStatusBarLogicTestWindow";
     static bool registered = false;
     if (!registered) {
@@ -54,8 +57,23 @@ HWND CreateTestWindow(const wchar_t* title, HWND parent, DWORD style) {
         ::RegisterClassExW(&wc);
         registered = true;
     }
-    return ::CreateWindowExW(0, kClass, title, style, 0, 0, 120, 80,
+    return ::CreateWindowExW(exStyle, kClass, title, style, 0, 0, 120, 80,
                              parent, nullptr, ::GetModuleHandleW(nullptr), nullptr);
+}
+
+BOOL CALLBACK CollectMonitorProc(HMONITOR monitor, HDC, LPRECT, LPARAM param) {
+    auto* monitors = reinterpret_cast<std::vector<HMONITOR>*>(param);
+    if (monitors && monitor) {
+        monitors->push_back(monitor);
+    }
+    return TRUE;
+}
+
+std::vector<HMONITOR> EnumerateMonitors() {
+    std::vector<HMONITOR> monitors;
+    ::EnumDisplayMonitors(nullptr, nullptr, &CollectMonitorProc,
+                          reinterpret_cast<LPARAM>(&monitors));
+    return monitors;
 }
 
 bool WriteSolidBmp(const std::wstring& path, int width, int height) {
@@ -88,7 +106,7 @@ bool WriteSolidBmp(const std::wstring& path, int width, int height) {
     return file.good();
 }
 
-std::wstring CreateTestSkinDirectory() {
+std::wstring CreateTestSkinDirectoryWithIni(const std::string& iniText) {
     wchar_t tempPath[MAX_PATH] = {};
     if (::GetTempPathW(_countof(tempPath), tempPath) == 0) {
         return L"";
@@ -97,7 +115,10 @@ std::wstring CreateTestSkinDirectory() {
     dir += L"MoqiStatusBarTest_";
     dir += std::to_wstring(::GetCurrentProcessId());
     dir += L"_";
+    static unsigned long sequence = 0;
     dir += std::to_wstring(::GetTickCount64());
+    dir += L"_";
+    dir += std::to_wstring(++sequence);
     if (!::CreateDirectoryW(dir.c_str(), nullptr)) {
         return L"";
     }
@@ -106,19 +127,24 @@ std::wstring CreateTestSkinDirectory() {
         return L"";
     }
     std::ofstream ini(dir + L"\\skin.ini", std::ios::binary | std::ios::trunc);
-    ini << "[Display]\n"
-           "font_size=16\n"
-           "[Scheme_H1]\n"
-           "pic=scheme.bmp\n"
-           "[StatusBar]\n"
-           "pic=bar.bmp\n"
-           "menu_display=1\n"
-           "menu_pos=0,0\n"
-           "menu=bar.bmp\n";
+    ini << iniText;
     if (!ini.good()) {
         return L"";
     }
     return dir;
+}
+
+std::wstring CreateTestSkinDirectory() {
+    return CreateTestSkinDirectoryWithIni(
+        "[Display]\n"
+        "font_size=16\n"
+        "[Scheme_H1]\n"
+        "pic=scheme.bmp\n"
+        "[StatusBar]\n"
+        "pic=bar.bmp\n"
+        "menu_display=1\n"
+        "menu_pos=0,0\n"
+        "menu=bar.bmp\n");
 }
 
 void RemoveTestSkinDirectory(const std::wstring& dir) {
@@ -129,6 +155,61 @@ void RemoveTestSkinDirectory(const std::wstring& dir) {
     ::DeleteFileW((dir + L"\\scheme.bmp").c_str());
     ::DeleteFileW((dir + L"\\bar.bmp").c_str());
     ::RemoveDirectoryW(dir.c_str());
+}
+
+std::wstring GetEnvironmentString(const wchar_t* name) {
+    wchar_t buffer[32768] = {};
+    const DWORD length = ::GetEnvironmentVariableW(name, buffer,
+                                                   _countof(buffer));
+    return length > 0 && length < _countof(buffer) ? std::wstring(buffer)
+                                                   : std::wstring();
+}
+
+// Creates an isolated %APPDATA% root with an empty \Moqi directory.  Callers
+// must restore the previous APPDATA value and remove the directory.
+std::wstring CreateTempAppDataRoot() {
+    wchar_t tempPath[MAX_PATH] = {};
+    if (::GetTempPathW(_countof(tempPath), tempPath) == 0) {
+        return L"";
+    }
+    std::wstring root = tempPath;
+    root += L"MoqiOptionsTest_";
+    root += std::to_wstring(::GetCurrentProcessId());
+    root += L"_";
+    root += std::to_wstring(::GetTickCount64());
+    if (!::CreateDirectoryW(root.c_str(), nullptr)) {
+        return L"";
+    }
+    if (!::CreateDirectoryW((root + L"\\Moqi").c_str(), nullptr)) {
+        ::RemoveDirectoryW(root.c_str());
+        return L"";
+    }
+    return root;
+}
+
+void RemoveTempAppDataRoot(const std::wstring& root) {
+    if (root.empty()) {
+        return;
+    }
+    ::DeleteFileW((root + L"\\Moqi\\sogou_skin_options.ini").c_str());
+    ::DeleteFileW((root + L"\\Moqi\\sogou_skin_overrides.ini").c_str());
+    ::DeleteFileW((root + L"\\Moqi\\sogou_skin_layouts.ini").c_str());
+    ::DeleteFileW((root + L"\\Moqi\\sogou_skin_path.txt").c_str());
+    ::RemoveDirectoryW((root + L"\\Moqi").c_str());
+    ::RemoveDirectoryW(root.c_str());
+}
+
+bool WriteOptionsFile(const std::wstring& root, const std::string& text) {
+    std::ofstream file(root + L"\\Moqi\\sogou_skin_options.ini",
+                       std::ios::binary | std::ios::trunc);
+    file << text;
+    return file.good();
+}
+
+bool WriteUtf8File(const std::wstring& path, const std::string& text) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file << text;
+    return file.good();
 }
 
 void TestKeyRepeatStateMachine() {
@@ -387,6 +468,288 @@ void TestStatusBarForegroundPolicy() {
     ::DestroyWindow(ownWindow);
 }
 
+void TestStatusBarFullscreenOptions() {
+    const std::wstring oldAppData = GetEnvironmentString(L"APPDATA");
+    const std::wstring oldEnv =
+        GetEnvironmentString(L"MOQI_SOGOU_STATUSBAR_FULLSCREEN");
+    const std::wstring root = CreateTempAppDataRoot();
+    Check(!root.empty(), "isolated APPDATA for fullscreen options");
+    if (root.empty()) {
+        return;
+    }
+    _wputenv_s(L"APPDATA", root.c_str());
+
+    const auto defaults = Moqi::SogouSkin::LoadOptions();
+    Check(defaults.statusbarFullscreenHide,
+          "fullscreen hide defaults to enabled");
+    Check(defaults.statusbarFullscreenScope ==
+              Moqi::SogouSkin::FullscreenScope::Monitor,
+          "fullscreen scope defaults to monitor");
+
+    Check(WriteOptionsFile(
+              root,
+              "[Options]\nstatusbar_fullscreen_hide=0\n"
+              "statusbar_fullscreen_scope=all\n"),
+          "fullscreen options file written");
+    const auto configured = Moqi::SogouSkin::LoadOptions();
+    Check(!configured.statusbarFullscreenHide,
+          "statusbar_fullscreen_hide=0 disables hiding");
+    Check(configured.statusbarFullscreenScope ==
+              Moqi::SogouSkin::FullscreenScope::All,
+          "statusbar_fullscreen_scope=all parsed");
+
+    Check(WriteOptionsFile(
+              root,
+              "[Options]\nstatusbar_fullscreen_hide=off\n"
+              "statusbar_fullscreen_scope=unknown\n"),
+          "false/unknown fullscreen options written");
+    const auto falseAndUnknown = Moqi::SogouSkin::LoadOptions();
+    Check(!falseAndUnknown.statusbarFullscreenHide,
+          "statusbar_fullscreen_hide=off disables hiding");
+    Check(falseAndUnknown.statusbarFullscreenScope ==
+              Moqi::SogouSkin::FullscreenScope::Monitor,
+          "unknown fullscreen scope falls back to monitor");
+
+    _wputenv_s(L"MOQI_SOGOU_STATUSBAR_FULLSCREEN", L"1");
+    const auto envEnabled = Moqi::SogouSkin::LoadOptions();
+    Check(envEnabled.statusbarFullscreenHide,
+          "environment override re-enables fullscreen hiding");
+    _wputenv_s(L"MOQI_SOGOU_STATUSBAR_FULLSCREEN", L"0");
+    const auto envDisabled = Moqi::SogouSkin::LoadOptions();
+    Check(!envDisabled.statusbarFullscreenHide,
+          "environment override disables fullscreen hiding");
+
+    _wputenv_s(L"MOQI_SOGOU_STATUSBAR_FULLSCREEN",
+               oldEnv.empty() ? L"" : oldEnv.c_str());
+    _wputenv_s(L"APPDATA",
+               oldAppData.empty() ? L"" : oldAppData.c_str());
+    RemoveTempAppDataRoot(root);
+}
+
+Moqi::SogouSkin::FullscreenMetrics MakeFullscreenMetrics() {
+    Moqi::SogouSkin::FullscreenMetrics metrics;
+    metrics.visible = true;
+    metrics.frameValid = true;
+    metrics.monitorValid = true;
+    metrics.monitor = RECT{0, 0, 1920, 1080};
+    metrics.work = RECT{0, 0, 1920, 1032};
+    metrics.frame = metrics.monitor;
+    return metrics;
+}
+
+void TestStatusBarFullscreenClassifier() {
+    using Moqi::SogouSkin::FullscreenMetrics;
+    using Moqi::SogouSkin::IsFullscreenWindowForMetrics;
+
+    Check(Moqi::SogouSkin::CoversMonitorRect(
+              RECT{0, 0, 1920, 1080}, RECT{0, 0, 1920, 1080}, 2),
+          "exact monitor coverage is fullscreen geometry");
+    Check(Moqi::SogouSkin::CoversMonitorRect(
+              RECT{-2, -2, 1922, 1082}, RECT{0, 0, 1920, 1080}, 2),
+          "small overhang still covers the monitor");
+    Check(!Moqi::SogouSkin::CoversMonitorRect(
+              RECT{0, 0, 1920, 1032}, RECT{0, 0, 1920, 1080}, 2),
+          "work area does not cover the monitor");
+
+    FullscreenMetrics normal = MakeFullscreenMetrics();
+    normal.frame = RECT{100, 100, 1280, 820};
+    Check(!IsFullscreenWindowForMetrics(normal),
+          "ordinary window is not fullscreen");
+
+    FullscreenMetrics maximized = MakeFullscreenMetrics();
+    maximized.frame = maximized.work;
+    maximized.maximized = true;
+    maximized.hasCaption = true;
+    maximized.hasThickFrame = true;
+    Check(!IsFullscreenWindowForMetrics(maximized),
+          "maximized framed window is not fullscreen");
+
+    FullscreenMetrics maximizedAutoHide = MakeFullscreenMetrics();
+    maximizedAutoHide.work = maximizedAutoHide.monitor;
+    maximizedAutoHide.frame = maximizedAutoHide.monitor;
+    maximizedAutoHide.maximized = true;
+    maximizedAutoHide.hasCaption = true;
+    maximizedAutoHide.hasThickFrame = true;
+    Check(!IsFullscreenWindowForMetrics(maximizedAutoHide),
+          "maximized framed window with auto-hide taskbar is not fullscreen");
+
+    FullscreenMetrics f11 = MakeFullscreenMetrics();
+    f11.hasCaption = true;
+    f11.hasThickFrame = true;
+    Check(IsFullscreenWindowForMetrics(f11),
+          "borderless F11-style window is fullscreen");
+
+    FullscreenMetrics borderlessGame = MakeFullscreenMetrics();
+    borderlessGame.popup = false; // WinForms games may not set WS_POPUP
+    Check(IsFullscreenWindowForMetrics(borderlessGame),
+          "borderless fullscreen game is fullscreen");
+
+    FullscreenMetrics borderlessMaximized = MakeFullscreenMetrics();
+    borderlessMaximized.maximized = true;
+    Check(IsFullscreenWindowForMetrics(borderlessMaximized),
+          "borderless maximized game is fullscreen");
+
+    FullscreenMetrics exclusive = MakeFullscreenMetrics();
+    exclusive.exclusiveD3DFullscreen = true;
+    Check(IsFullscreenWindowForMetrics(exclusive),
+          "exclusive D3D state with fullscreen geometry is fullscreen");
+
+    FullscreenMetrics exclusiveSmall = MakeFullscreenMetrics();
+    exclusiveSmall.frame = RECT{100, 100, 800, 600};
+    exclusiveSmall.exclusiveD3DFullscreen = true;
+    Check(!IsFullscreenWindowForMetrics(exclusiveSmall),
+          "stale exclusive D3D state does not hide over a small window");
+
+    FullscreenMetrics busyWindowed = MakeFullscreenMetrics();
+    busyWindowed.frame = RECT{100, 100, 1280, 820};
+    busyWindowed.shellBusy = true;
+    Check(!IsFullscreenWindowForMetrics(busyWindowed),
+          "QUNS_BUSY with a small window is not fullscreen");
+
+    FullscreenMetrics busyPresentationMaximized = MakeFullscreenMetrics();
+    busyPresentationMaximized.frame = busyPresentationMaximized.monitor;
+    busyPresentationMaximized.maximized = true;
+    busyPresentationMaximized.hasCaption = true;
+    busyPresentationMaximized.shellBusy = true;
+    Check(!IsFullscreenWindowForMetrics(busyPresentationMaximized),
+          "QUNS_BUSY does not override the maximized-window guard");
+
+    FullscreenMetrics busyTolerance = MakeFullscreenMetrics();
+    busyTolerance.frame = RECT{8, 8, 1912, 1072};
+    busyTolerance.shellBusy = true;
+    Check(IsFullscreenWindowForMetrics(busyTolerance),
+          "QUNS_BUSY tolerates small DPI/rounding gaps");
+
+    FullscreenMetrics inset = MakeFullscreenMetrics();
+    inset.frame = RECT{10, 10, 1910, 1070};
+    Check(!IsFullscreenWindowForMetrics(inset),
+          "a clearly inset window is not fullscreen");
+
+    FullscreenMetrics shell = MakeFullscreenMetrics();
+    shell.shellWindow = true;
+    Check(!IsFullscreenWindowForMetrics(shell),
+          "desktop shell is never fullscreen");
+
+    FullscreenMetrics cloaked = MakeFullscreenMetrics();
+    cloaked.cloaked = true;
+    Check(!IsFullscreenWindowForMetrics(cloaked),
+          "cloaked UWP window is not fullscreen");
+
+    FullscreenMetrics iconic = MakeFullscreenMetrics();
+    iconic.iconic = true;
+    Check(!IsFullscreenWindowForMetrics(iconic),
+          "minimized window is not fullscreen");
+
+    FullscreenMetrics secondary = MakeFullscreenMetrics();
+    secondary.monitor = RECT{1920, 0, 3840, 1080};
+    secondary.work = RECT{1920, 0, 3840, 1032};
+    secondary.frame = secondary.monitor;
+    Check(IsFullscreenWindowForMetrics(secondary),
+          "secondary-monitor fullscreen uses the same geometry rules");
+}
+
+void TestStatusBarFullscreenDebounce() {
+    Moqi::SogouSkin::FullscreenSuppressionDebouncer debouncer(400);
+    Check(!debouncer.active(), "fullscreen debouncer starts inactive");
+    Check(debouncer.update(true, 1000),
+          "fullscreen enters immediately");
+    Check(debouncer.update(false, 1100),
+          "fullscreen exit waits inside the hysteresis window");
+    Check(debouncer.update(false, 1499),
+          "fullscreen exit is still waiting before the deadline");
+    Check(!debouncer.update(false, 1500),
+          "fullscreen exit releases after the hysteresis window");
+    debouncer.update(true, 2000);
+    debouncer.reset();
+    Check(!debouncer.active(), "fullscreen debouncer reset clears state");
+}
+
+void TestStatusBarFullscreenPolicy() {
+    HWND ownWindow = CreateTestWindow(L"Moqi fullscreen policy owner",
+                                      nullptr, WS_OVERLAPPEDWINDOW);
+    HWND foreignWindow = ::GetShellWindow();
+    if (foreignWindow) {
+        DWORD foreignPid = 0;
+        ::GetWindowThreadProcessId(foreignWindow, &foreignPid);
+        if (foreignPid == ::GetCurrentProcessId()) {
+            foreignWindow = nullptr;
+        }
+    }
+    Check(ownWindow != nullptr, "fullscreen policy test window created");
+    if (!ownWindow) {
+        return;
+    }
+
+    using Policy = Moqi::SogouSkin::StatusBarForegroundPolicy;
+    using Action = Policy::Action;
+
+    Policy suppressedShow(::GetCurrentProcessId(), 1000);
+    Check(suppressedShow.requestShow(ownWindow, true, 1000) == Action::None,
+          "fullscreen show request stays hidden");
+    Check(suppressedShow.showRequested(),
+          "fullscreen show request is retained");
+    Check(suppressedShow.evaluate(ownWindow, true, false, 1400) ==
+              Action::None,
+          "fullscreen suppression keeps polling");
+    Check(suppressedShow.evaluate(ownWindow, false, false, 1800) ==
+              Action::Show,
+          "leaving fullscreen shows the retained bar");
+
+    Policy visibleSuppressed(::GetCurrentProcessId(), 1000);
+    Check(visibleSuppressed.requestShow(ownWindow, false, 1000) ==
+              Action::Show,
+          "ordinary show request shows immediately");
+    Check(visibleSuppressed.evaluate(ownWindow, true, true, 1100) ==
+              Action::Suppress,
+          "visible bar is suppressed in fullscreen");
+    Check(visibleSuppressed.evaluate(ownWindow, true, false, 1200) ==
+              Action::None,
+          "hidden suppressed bar keeps waiting");
+    Check(visibleSuppressed.evaluate(ownWindow, false, false, 1600) ==
+              Action::Show,
+          "hidden suppressed bar returns after fullscreen");
+
+    Policy foregroundLoss(::GetCurrentProcessId(), 1000);
+    foregroundLoss.requestShow(ownWindow, true, 1000);
+    foregroundLoss.evaluate(ownWindow, true, true, 1100);
+    if (foreignWindow) {
+        Check(foregroundLoss.evaluate(foreignWindow, true, true, 1200) ==
+                  Action::Hide,
+              "foreground loss hides a suppressed bar");
+        Check(!foregroundLoss.showRequested(),
+              "foreground loss clears the retained request");
+
+        Policy pendingFullscreen(::GetCurrentProcessId(), 1000);
+        Check(pendingFullscreen.requestShow(foreignWindow, false, 1000) ==
+                  Action::None,
+              "pending show during a foreground transition stays hidden");
+        Check(pendingFullscreen.evaluate(ownWindow, true, false, 1200) ==
+                  Action::None,
+              "pending show does not flash when it lands on fullscreen");
+        Check(pendingFullscreen.showRequested(),
+              "pending fullscreen show keeps the request");
+        Check(pendingFullscreen.evaluate(ownWindow, false, false, 1600) ==
+                  Action::Show,
+              "pending show returns after leaving fullscreen");
+    } else {
+        Skip("no foreign window for suppressed foreground-loss check");
+    }
+
+    Policy explicitHide(::GetCurrentProcessId(), 1000);
+    explicitHide.requestShow(ownWindow, false, 1000);
+    explicitHide.evaluate(ownWindow, true, true, 1100);
+    explicitHide.clear();
+    Check(!explicitHide.showRequested(),
+          "explicit hide clears a suppressed request");
+    Check(explicitHide.evaluate(ownWindow, false, false, 1200) ==
+              Action::StopPolling,
+          "explicit hide stops polling");
+    Check(explicitHide.requestShow(ownWindow, false, 1300) == Action::Show,
+          "show after explicit hide still works");
+
+    ::DestroyWindow(ownWindow);
+}
+
 void PumpMessagesFor(DWORD milliseconds) {
     const ULONGLONG deadline = ::GetTickCount64() + milliseconds;
     while (::GetTickCount64() < deadline) {
@@ -639,6 +1002,538 @@ int RunStatusBarSmokeTest() {
     return g_failures == 0 ? 0 : 1;
 }
 
+int RunStatusBarFullscreenSmokeTest() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("Moqi status bar fullscreen smoke test\n");
+    const std::wstring oldAppData = GetEnvironmentString(L"APPDATA");
+    const std::wstring configRoot = CreateTempAppDataRoot();
+    Check(!configRoot.empty(), "fullscreen smoke isolated APPDATA created");
+    if (configRoot.empty()) {
+        return 1;
+    }
+    _wputenv_s(L"APPDATA", configRoot.c_str());
+    Check(WriteOptionsFile(configRoot,
+                           "[Options]\nstatusbar=1\n"
+                           "statusbar_fullscreen_hide=1\n"
+                           "statusbar_fullscreen_scope=monitor\n"),
+          "fullscreen smoke options written");
+
+    const std::wstring skinDir = CreateTestSkinDirectory();
+    Check(!skinDir.empty(), "fullscreen smoke skin created");
+    if (skinDir.empty()) {
+        _wputenv_s(L"APPDATA",
+                   oldAppData.empty() ? L"" : oldAppData.c_str());
+        RemoveTempAppDataRoot(configRoot);
+        return 1;
+    }
+
+    HWND host = CreateTestWindow(L"Moqi fullscreen smoke host", nullptr,
+                                 WS_POPUP, WS_EX_TOPMOST);
+    Check(host != nullptr, "fullscreen smoke popup created");
+    if (!host) {
+        RemoveTestSkinDirectory(skinDir);
+        _wputenv_s(L"APPDATA",
+                   oldAppData.empty() ? L"" : oldAppData.c_str());
+        RemoveTempAppDataRoot(configRoot);
+        return 1;
+    }
+
+    POINT origin = {0, 0};
+    HMONITOR primaryMonitor =
+        ::MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    const bool haveMonitor =
+        primaryMonitor && ::GetMonitorInfoW(primaryMonitor, &monitorInfo);
+    Check(haveMonitor, "fullscreen smoke primary monitor resolved");
+    if (haveMonitor) {
+        ::SetWindowPos(host, HWND_TOPMOST, monitorInfo.rcMonitor.left,
+                       monitorInfo.rcMonitor.top,
+                       monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+                       monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+                       SWP_SHOWWINDOW);
+    }
+
+    {
+        std::wstring error;
+        auto theme = Moqi::SogouSkin::Theme::LoadWithOverrides(skinDir, L"",
+                                                               &error);
+        Check(theme != nullptr, "fullscreen smoke theme loads");
+        if (theme && haveMonitor) {
+            Moqi::SogouSkin::StatusBarWindow bar(
+                theme, {}, {}, L"MoqiSogouSkinStatusBarTest");
+            Check(bar.create(), "fullscreen smoke status bar created");
+            if (!ForceForeground(host)) {
+                Skip("could not acquire foreground for fullscreen smoke");
+            } else {
+                bar.show();
+                PumpMessagesFor(600);
+                Check(!bar.isVisible(),
+                      "status bar stays hidden over a fullscreen popup");
+                Check(bar.isStateTimerActive(),
+                      "fullscreen suppression keeps polling");
+
+                ::SetWindowPos(host, HWND_TOPMOST, monitorInfo.rcMonitor.left + 80,
+                               monitorInfo.rcMonitor.top + 80, 800, 600,
+                               SWP_SHOWWINDOW);
+                PumpMessagesFor(1600);
+                Check(bar.isVisible(),
+                      "status bar returns after leaving fullscreen");
+
+                // Disabling the option must restore the old behavior even
+                // while the foreground window is fullscreen.
+                Check(WriteOptionsFile(configRoot,
+                                       "[Options]\nstatusbar=1\n"
+                                       "statusbar_fullscreen_hide=0\n"
+                                       "statusbar_fullscreen_scope=monitor\n"),
+                      "fullscreen smoke disable option written");
+                ::SetWindowPos(host, HWND_TOPMOST,
+                               monitorInfo.rcMonitor.left,
+                               monitorInfo.rcMonitor.top,
+                               monitorInfo.rcMonitor.right -
+                                   monitorInfo.rcMonitor.left,
+                               monitorInfo.rcMonitor.bottom -
+                                   monitorInfo.rcMonitor.top,
+                               SWP_SHOWWINDOW);
+                bar.show();
+                PumpMessagesFor(700);
+                Check(bar.isVisible(),
+                      "statusbar_fullscreen_hide=0 keeps the bar visible");
+
+                Check(WriteOptionsFile(configRoot,
+                                       "[Options]\nstatusbar=1\n"
+                                       "statusbar_fullscreen_hide=1\n"
+                                       "statusbar_fullscreen_scope=all\n"),
+                      "fullscreen smoke scope=all option written");
+                bar.show();
+                PumpMessagesFor(600);
+                Check(!bar.isVisible(),
+                      "statusbar_fullscreen_scope=all hides on any monitor");
+
+                // Multi-monitor: a fullscreen window on the other monitor
+                // must not hide a bar that lives on a different monitor when
+                // scope=monitor; scope=all must hide it.
+                const auto monitors = EnumerateMonitors();
+                const HMONITOR barMonitor = ::MonitorFromWindow(
+                    bar.hwnd(), MONITOR_DEFAULTTONEAREST);
+                HMONITOR otherMonitor = nullptr;
+                for (HMONITOR monitor : monitors) {
+                    if (monitor != barMonitor) {
+                        otherMonitor = monitor;
+                        break;
+                    }
+                }
+                if (otherMonitor) {
+                    MONITORINFO otherInfo = {};
+                    otherInfo.cbSize = sizeof(otherInfo);
+                    if (::GetMonitorInfoW(otherMonitor, &otherInfo)) {
+                        ::SetWindowPos(
+                            host, HWND_TOPMOST, otherInfo.rcMonitor.left,
+                            otherInfo.rcMonitor.top,
+                            otherInfo.rcMonitor.right -
+                                otherInfo.rcMonitor.left,
+                            otherInfo.rcMonitor.bottom -
+                                otherInfo.rcMonitor.top,
+                            SWP_SHOWWINDOW);
+                        if (ForceForeground(host)) {
+                            Check(WriteOptionsFile(
+                                      configRoot,
+                                      "[Options]\nstatusbar=1\n"
+                                      "statusbar_fullscreen_hide=1\n"
+                                      "statusbar_fullscreen_scope=monitor\n"),
+                                  "multi-monitor scope=monitor option written");
+                            bar.show();
+                            PumpMessagesFor(700);
+                            Check(bar.isVisible(),
+                                  "bar stays visible when fullscreen is on "
+                                  "another monitor");
+
+                            Check(WriteOptionsFile(
+                                      configRoot,
+                                      "[Options]\nstatusbar=1\n"
+                                      "statusbar_fullscreen_hide=1\n"
+                                      "statusbar_fullscreen_scope=all\n"),
+                                  "multi-monitor scope=all option written");
+                            bar.show();
+                            PumpMessagesFor(700);
+                            Check(!bar.isVisible(),
+                                  "scope=all hides the bar for another-monitor "
+                                  "fullscreen");
+
+                            ::SetWindowPos(host, HWND_TOPMOST,
+                                           otherInfo.rcMonitor.left + 80,
+                                           otherInfo.rcMonitor.top + 80, 800,
+                                           600, SWP_SHOWWINDOW);
+                            PumpMessagesFor(1600);
+                            Check(bar.isVisible(),
+                                  "bar returns after other-monitor fullscreen "
+                                  "ends");
+                        } else {
+                            Skip("could not acquire foreground on second monitor");
+                        }
+                    } else {
+                        Skip("second monitor info unavailable");
+                    }
+                } else {
+                    Skip("second monitor unavailable for scope test");
+                }
+
+                // Regression guard for the taskbar-auto-hide case: a normal
+                // maximized framed window covers the whole monitor there but
+                // must keep the status bar visible.
+                HWND maximizedHost = CreateTestWindow(
+                    L"Moqi fullscreen smoke maximized host", nullptr,
+                    WS_OVERLAPPEDWINDOW);
+                if (maximizedHost) {
+                    ::ShowWindow(maximizedHost, SW_MAXIMIZE);
+                    if (ForceForeground(maximizedHost)) {
+                        Check(WriteOptionsFile(
+                                  configRoot,
+                                  "[Options]\nstatusbar=1\n"
+                                  "statusbar_fullscreen_hide=1\n"
+                                  "statusbar_fullscreen_scope=monitor\n"),
+                              "maximized-window option written");
+                        bar.show();
+                        PumpMessagesFor(500);
+                        Check(bar.isVisible(),
+                              "maximized framed window is not treated as "
+                              "fullscreen");
+                    } else {
+                        Skip("could not foreground the maximized test window");
+                    }
+                    ::DestroyWindow(maximizedHost);
+                } else {
+                    Skip("maximized test window unavailable");
+                }
+            }
+            bar.hide();
+        }
+    }
+
+    ::DestroyWindow(host);
+    RemoveTestSkinDirectory(skinDir);
+    _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+    RemoveTempAppDataRoot(configRoot);
+    std::printf("failures=%d\n", g_failures);
+    return g_failures == 0 ? 0 : 1;
+}
+
+void TestFontScaleAndLegacyMigration() {
+    const std::wstring oldAppData = GetEnvironmentString(L"APPDATA");
+    const std::wstring root = CreateTempAppDataRoot();
+    Check(!root.empty(), "font/scale migration isolated APPDATA created");
+    if (root.empty()) {
+        return;
+    }
+    _wputenv_s(L"APPDATA", root.c_str());
+    const std::wstring skinDir = CreateTestSkinDirectory();
+    Check(!skinDir.empty(), "font/scale migration skin created");
+    if (skinDir.empty()) {
+        _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+        RemoveTempAppDataRoot(root);
+        return;
+    }
+    const std::wstring overrides = root + L"\\Moqi\\sogou_skin_overrides.ini";
+
+    std::wstring error;
+    auto base = Moqi::SogouSkin::Theme::LoadWithOverrides(skinDir, L"", &error);
+    Check(base != nullptr, "factory theme loads");
+    if (base) {
+        Check(base->display().fontSize == 16,
+              "factory font_size remains the design text size");
+        Check(base->display().scalePercent == 100,
+              "factory whole-skin scale defaults to 100%");
+        Moqi::SogouSkin::Renderer renderer(base, 96);
+        Check(renderer.designFontPixelSize() == 16 &&
+                  std::abs(renderer.scale() - 1.0) < 1e-9,
+              "factory 100% renderer stays at 1.0");
+    }
+
+    // Legacy file without a marker: font_size was both text size and global
+    // scale.  24 / 16 must become scale=150 with the native 16 px font.
+    Check(WriteUtf8File(overrides, "[Display]\nfont_size=24\n"),
+          "legacy override written");
+    auto legacy = Moqi::SogouSkin::Theme::LoadWithOverrides(skinDir, overrides, &error);
+    Check(legacy != nullptr, "legacy override theme loads");
+    if (legacy) {
+        Check(legacy->display().fontSize == 16,
+              "legacy font_size migrates text size back to skin base");
+        Check(legacy->display().scalePercent == 150,
+              "legacy font_size 24/16 migrates to scale 150%");
+        Moqi::SogouSkin::Renderer renderer(legacy, 96);
+        Check(std::abs(renderer.scale() - 1.5) < 1e-9,
+              "legacy migration preserves the old window scale");
+    }
+
+    // The previous settings UI wrote version=2 with the same combined
+    // semantics; it must migrate too.
+    Check(WriteUtf8File(
+              overrides,
+              "[Display]\nfont_size=24\n"
+              "[MoqiOverrides]\nversion=2\nlayout_mode=global\n"),
+          "version 2 override written");
+    auto version2 = Moqi::SogouSkin::Theme::LoadWithOverrides(skinDir, overrides, &error);
+    if (version2) {
+        Check(version2->display().fontSize == 16 &&
+                  version2->display().scalePercent == 150,
+              "version 2 file receives the same legacy migration");
+    } else {
+        Check(false, "version 2 override theme loads");
+    }
+
+    // New semantics: independent actual font size and global scale.
+    Check(WriteUtf8File(
+              overrides,
+              "[Display]\nfont_size=20\nscale=80\n"
+              "[MoqiOverrides]\nversion=3\n"),
+          "new-format override written");
+    auto modern = Moqi::SogouSkin::Theme::LoadWithOverrides(skinDir, overrides, &error);
+    if (modern) {
+        Check(modern->display().fontSize == 20,
+              "new font_size is the actual text size");
+        Check(modern->display().scalePercent == 80,
+              "new scale is the whole-skin percentage");
+        Moqi::SogouSkin::Renderer renderer(modern, 96);
+        Check(renderer.designFontPixelSize() == 20 &&
+                  std::abs(renderer.scale() - 0.8) < 1e-9,
+              "new font size does not multiply the whole-window scale");
+    } else {
+        Check(false, "new-format override theme loads");
+    }
+
+    if (base) {
+        Moqi::SogouSkin::SettingsOverrides values;
+        values.fontSize = 18;
+        values.scalePercent = 130;
+        const std::wstring text =
+            Moqi::SogouSkin::BuildSettingsOverridesText(*base, overrides, values);
+        Check(text.find(L"font_size=18") != std::wstring::npos,
+              "settings saves the independent font size");
+        Check(text.find(L"scale=130") != std::wstring::npos,
+              "settings saves the global scale percentage");
+        Check(text.find(L"version=3") != std::wstring::npos,
+              "settings marks the file as version 3");
+
+        // Saving over an old version=2 file must preserve the migrated window
+        // scale instead of writing the raw old font size as the new font.
+        Check(WriteUtf8File(
+                  overrides,
+                  "[Display]\nfont_size=24\n"
+                  "[MoqiOverrides]\nversion=2\nlayout_mode=global\n"),
+              "version 2 file restored for save migration");
+        auto migrated = Moqi::SogouSkin::Theme::LoadWithOverrides(
+            skinDir, overrides, &error);
+        if (migrated) {
+            Moqi::SogouSkin::SettingsOverrides migratedValues;
+            migratedValues.fontSize = migrated->display().fontSize;
+            migratedValues.scalePercent = migrated->display().scalePercent;
+            const std::wstring migratedText =
+                Moqi::SogouSkin::BuildSettingsOverridesText(
+                    *base, overrides, migratedValues);
+            Check(migratedText.find(L"font_size=16") != std::wstring::npos &&
+                      migratedText.find(L"scale=150") != std::wstring::npos,
+                  "saving an old file writes migrated font size and scale");
+        } else {
+            Check(false, "version 2 save-migration theme loads");
+        }
+    }
+
+    _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+    RemoveTestSkinDirectory(skinDir);
+    RemoveTempAppDataRoot(root);
+}
+
+void TestSkinLayoutStorage() {
+    const std::wstring oldAppData = GetEnvironmentString(L"APPDATA");
+    const std::wstring root = CreateTempAppDataRoot();
+    Check(!root.empty(), "layout storage isolated APPDATA created");
+    if (root.empty()) {
+        return;
+    }
+    _wputenv_s(L"APPDATA", root.c_str());
+    const std::wstring skinA = CreateTestSkinDirectoryWithIni(
+        "[Display]\nfont_size=16\n[Scheme_H1]\npic=scheme.bmp\n");
+    const std::wstring skinB = CreateTestSkinDirectoryWithIni(
+        "[Display]\nfont_size=20\n[Scheme_H1]\npic=scheme.bmp\n");
+    Check(!skinA.empty() && !skinB.empty(), "two layout test skins created");
+    if (skinA.empty() || skinB.empty()) {
+        if (!skinA.empty()) RemoveTestSkinDirectory(skinA);
+        if (!skinB.empty()) RemoveTestSkinDirectory(skinB);
+        _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+        RemoveTempAppDataRoot(root);
+        return;
+    }
+
+    std::wstring errorA;
+    std::wstring errorB;
+    auto themeA = Moqi::SogouSkin::Theme::LoadWithOverrides(skinA, L"", &errorA);
+    auto themeB = Moqi::SogouSkin::Theme::LoadWithOverrides(skinB, L"", &errorB);
+    Check(themeA && themeB, "layout test themes load");
+    if (themeA && themeB) {
+        Check(!themeA->skinId().empty() && themeA->skinId() != themeB->skinId(),
+              "different skins get different stable section ids");
+        Check(themeA->layout().preeditX == 0 && themeA->layout().candidateY == 0,
+              "per-skin layout defaults to zero");
+
+        Moqi::SogouSkin::SkinLayout a;
+        a.preeditX = 10;
+        a.preeditY = -5;
+        a.candidateX = 20;
+        a.candidateY = -15;
+        Check(Moqi::SogouSkin::SaveSkinLayoutOffsets(themeA->skinId(), a),
+              "skin A layout saved");
+        Moqi::SogouSkin::SkinLayout b;
+        b.preeditX = -1;
+        b.preeditY = 2;
+        b.candidateX = -3;
+        b.candidateY = 4;
+        Check(Moqi::SogouSkin::SaveSkinLayoutOffsets(themeB->skinId(), b),
+              "skin B layout saved");
+
+        auto reloadA = Moqi::SogouSkin::Theme::LoadWithOverrides(skinA, L"", &errorA);
+        auto reloadB = Moqi::SogouSkin::Theme::LoadWithOverrides(skinB, L"", &errorB);
+        Check(reloadA && reloadA->layout().preeditX == 10 &&
+                  reloadA->layout().preeditY == -5 &&
+                  reloadA->layout().candidateX == 20 &&
+                  reloadA->layout().candidateY == -15,
+              "skin A reloads its own offsets");
+        Check(reloadB && reloadB->layout().preeditX == -1 &&
+                  reloadB->layout().preeditY == 2 &&
+                  reloadB->layout().candidateX == -3 &&
+                  reloadB->layout().candidateY == 4,
+              "skin B does not inherit skin A offsets");
+
+        Moqi::SogouSkin::SkinLayout clamped;
+        clamped.preeditX = 200;
+        clamped.preeditY = -300;
+        clamped.candidateX = 101;
+        clamped.candidateY = -101;
+        Check(Moqi::SogouSkin::SaveSkinLayoutOffsets(themeA->skinId(), clamped),
+              "out-of-range layout saved");
+        const auto clampedLoad =
+            Moqi::SogouSkin::LoadSkinLayoutOffsets(themeA->skinId());
+        Check(clampedLoad.preeditX == 100 && clampedLoad.preeditY == -100 &&
+                  clampedLoad.candidateX == 100 &&
+                  clampedLoad.candidateY == -100,
+              "layout offsets clamp to -100..100 design pixels");
+
+        const std::wstring customPath = root + L"\\custom_layouts.ini";
+        Check(WriteUtf8File(customPath, "[Custom]\nkeep_me=1\n"),
+              "custom layout section written");
+        const std::wstring merged = Moqi::SogouSkin::BuildSkinLayoutsText(
+            customPath, themeA->skinId(), a);
+        Check(merged.find(L"[custom]") != std::wstring::npos &&
+                  merged.find(L"keep_me=1") != std::wstring::npos,
+              "layout writer preserves unrelated sections");
+        Check(merged.find(L"preedit_x=10") != std::wstring::npos,
+              "layout writer emits the current skin section");
+    }
+
+    RemoveTestSkinDirectory(skinA);
+    RemoveTestSkinDirectory(skinB);
+    _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+    RemoveTempAppDataRoot(root);
+}
+
+void TestRendererFontScaleAndOffsets() {
+    const std::wstring oldAppData = GetEnvironmentString(L"APPDATA");
+    const std::wstring root = CreateTempAppDataRoot();
+    Check(!root.empty(), "renderer offset test APPDATA created");
+    if (root.empty()) {
+        return;
+    }
+    _wputenv_s(L"APPDATA", root.c_str());
+    const std::wstring skinDir = CreateTestSkinDirectoryWithIni(
+        "[Display]\nfont_size=16\n"
+        "[Scheme_V1]\n"
+        "pic=scheme.bmp\n"
+        "pinyin_marge=4,2,6,8\n"
+        "zhongwen_marge=5,3,7,9\n"
+        "[Render]\nitem_spacing=3\n");
+    Check(!skinDir.empty(), "renderer offset skin created");
+    if (skinDir.empty()) {
+        _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+        RemoveTempAppDataRoot(root);
+        return;
+    }
+
+    std::wstring error;
+    auto theme = Moqi::SogouSkin::Theme::LoadWithOverrides(skinDir, L"", &error);
+    Check(theme != nullptr, "renderer offset theme loads");
+    if (theme) {
+        Moqi::SogouSkin::RenderState state;
+        state.preedit = L"moqi";
+        state.candidates = {L"墨奇", L"默契"};
+        state.selKeys = L"12";
+        state.candPerRow = 1;
+        HDC dc = ::GetDC(nullptr);
+        Moqi::SogouSkin::Renderer renderer(theme, 96);
+        const auto baseline = renderer.measure(state, dc);
+
+        Moqi::SogouSkin::SkinLayout nudges;
+        nudges.preeditX = 10;
+        nudges.preeditY = 5;
+        nudges.candidateX = 20;
+        nudges.candidateY = 7;
+        theme->setLayout(nudges);
+        const auto shifted = renderer.measure(state, dc);
+        Check(shifted.width == baseline.width && shifted.height == baseline.height,
+              "nudges do not resize or move the background plan");
+        Check(shifted.preeditRect.left == baseline.preeditRect.left + 10 &&
+                  shifted.preeditRect.top == baseline.preeditRect.top + 5,
+              "preedit X/Y nudges apply in design pixels");
+        Check(shifted.candidateRects.size() == baseline.candidateRects.size() &&
+                  shifted.candidateRects[0].left ==
+                      baseline.candidateRects[0].left + 20 &&
+                  shifted.candidateRects[0].top ==
+                      baseline.candidateRects[0].top + 7,
+              "candidate X/Y nudges apply to the click rects");
+        Check(baseline.preeditRect.left == 6,
+              "font size does not multiply the skin's left margin");
+
+        Moqi::SogouSkin::Renderer hidpi(theme, 144);
+        const auto scaled = hidpi.measure(state, dc);
+        Check(scaled.preeditRect.left == 24 && scaled.preeditRect.top == 14,
+              "nudges scale correctly with DPI");
+        ::ReleaseDC(nullptr, dc);
+
+        Moqi::SogouSkin::SettingsOverrides values;
+        values.fontSize = 24;
+        values.scalePercent = 100;
+        const std::wstring text = Moqi::SogouSkin::BuildSettingsOverridesText(
+            *theme, L"", values);
+        Check(text.find(L"font_size=24") != std::wstring::npos &&
+                  text.find(L"scale=100") != std::wstring::npos,
+              "settings writer keeps the 100% scale with a larger font");
+        const std::wstring overridePath =
+            root + L"\\Moqi\\sogou_skin_overrides.ini";
+        Check(WriteUtf8File(overridePath, "[Display]\nfont_size=24\nscale=100\n"
+                                         "[MoqiOverrides]\nversion=3\n"),
+              "large-font override written");
+        auto largeTheme = Moqi::SogouSkin::Theme::LoadWithOverrides(
+            skinDir, overridePath, &error);
+        if (largeTheme) {
+            Moqi::SogouSkin::Renderer largeRenderer(largeTheme, 96);
+            Check(largeRenderer.designFontPixelSize() == 24 &&
+                      std::abs(largeRenderer.scale() - 1.0) < 1e-9,
+                  "large font keeps the global scale at 100%");
+            HDC largeDc = ::GetDC(nullptr);
+            const auto largeLayout = largeRenderer.measure(state, largeDc);
+            ::ReleaseDC(nullptr, largeDc);
+            Check(largeLayout.preeditRect.left == 6,
+                  "large font does not multiply the 9-slice margin");
+            Check(largeLayout.height >= baseline.height,
+                  "large font may grow the layout for measured text");
+        } else {
+            Check(false, "large-font theme loads");
+        }
+    }
+
+    RemoveTestSkinDirectory(skinDir);
+    _wputenv_s(L"APPDATA", oldAppData.empty() ? L"" : oldAppData.c_str());
+    RemoveTempAppDataRoot(root);
+}
+
 void TestSogouUModeDisplay() {
     using Moqi::BuildSogouUModePreedit;
     Check(BuildSogouUModePreedit(L"u'shui'shang", L"shui'shang") ==
@@ -681,6 +1576,39 @@ void TestSogouUModeDisplay() {
           "ordinary pinyin starting with u is not decorated");
     Check(BuildSogouUModePreedit(L"ushui", L"ushui") == L"ushui",
           "ordinary pinyin that keeps the full u is not decorated");
+
+    // Enter on a u-mode gesture: only the consumed lookup prefix is removed.
+    // When the whole input is just `u` characters there is no lookup body, so
+    // the exact typed count must be committed (`u`, `uu`, `uuu`).
+    using Moqi::ApplyUModeEnterCommit;
+    Check(ApplyUModeEnterCommit(L"u", L"u") == L"u",
+          "u-mode Enter commits a lone u");
+    Check(ApplyUModeEnterCommit(L"uu", L"uu") == L"uu",
+          "u-mode Enter preserves a typed uu sequence");
+    Check(ApplyUModeEnterCommit(L"uuu", L"uuu") == L"uuu",
+          "u-mode Enter preserves a typed uuu sequence");
+    Check(ApplyUModeEnterCommit(L"u'", L"u") == L"u",
+          "u-mode Enter keeps u when only separators follow it");
+    Check(ApplyUModeEnterCommit(L"u'shui", L"ushui") == L"shui",
+          "u-mode Enter strips the prefix from a lookup body");
+    Check(ApplyUModeEnterCommit(L"ushui", L"ushui") == L"shui",
+          "u-mode Enter handles commits without pretty separators");
+    Check(ApplyUModeEnterCommit(L"us", L"𢌽") == L"𢌽",
+          "u-mode Chinese candidate commits are untouched");
+    Check(ApplyUModeEnterCommit(L"", L"u") == L"u",
+          "Enter without a tracked gesture is untouched");
+    Check(ApplyUModeEnterCommit(L"u", L"") == L"",
+          "empty Enter commit stays empty");
+
+    using Moqi::ShouldKeepPreeditWindow;
+    Check(ShouldKeepPreeditWindow(true, true, false),
+          "zero-candidate composition keeps an external preedit window");
+    Check(!ShouldKeepPreeditWindow(true, false, false),
+          "inline preedit does not force an empty candidate window");
+    Check(!ShouldKeepPreeditWindow(false, true, false),
+          "finished composition still hides the candidate window");
+    Check(ShouldKeepPreeditWindow(false, true, true),
+          "u-mode tip-only state keeps its preedit window");
 
     Moqi::UModeInputTracker tracker;
     tracker.onKeyEvent(L'u', 'U', true, true, true, false, true);
@@ -772,6 +1700,9 @@ int wmain(int argc, wchar_t** argv) {
     if (argc > 1 && _wcsicmp(argv[1], L"--statusbar-smoke") == 0) {
         return RunStatusBarSmokeTest();
     }
+    if (argc > 1 && _wcsicmp(argv[1], L"--statusbar-fullscreen-smoke") == 0) {
+        return RunStatusBarFullscreenSmokeTest();
+    }
     if (argc > 1 && _wcsicmp(argv[1], L"--webview-check") == 0) {
         std::printf("Moqi WebView2 window ownership check\n");
         TestWebView2HostIfPresent();
@@ -785,7 +1716,14 @@ int wmain(int argc, wchar_t** argv) {
     TestDefaultFonts();
     TestForegroundOwnership();
     TestStatusBarForegroundPolicy();
+    TestStatusBarFullscreenOptions();
+    TestStatusBarFullscreenClassifier();
+    TestStatusBarFullscreenDebounce();
+    TestStatusBarFullscreenPolicy();
     TestStatusBarWindowLifecycle();
+    TestFontScaleAndLegacyMigration();
+    TestSkinLayoutStorage();
+    TestRendererFontScaleAndOffsets();
     TestSogouUModeDisplay();
     std::printf("failures=%d\n", g_failures);
     return g_failures == 0 ? 0 : 1;

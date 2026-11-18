@@ -73,6 +73,7 @@ section/key 合并，可覆盖任意已支持的皮肤字段：
 ```ini
 [Display]
 font_size=30
+scale=120
 
 [Scheme_H1]
 layout_horizontal=1,93,150
@@ -92,13 +93,21 @@ pinyin_separator=auto
 candidate_row_height=0
 
 [MoqiOverrides]
-version=2
+version=3
 layout_mode=global
 ```
 
-新版设置 UI 会自动写 `[MoqiOverrides]` 标记：有该标记时，
+`[Display] font_size` 是新语义下的“实际字体大小”（皮肤设计像素），只影响字形测量、
+候选行高和容纳文字所需的布局增长；`[Display] scale` 是整窗缩放百分比（50–300，
+100 为皮肤原始尺寸），9-slice 背景、边距、分隔线和候选 rect 一起按它缩放。
+
+新版设置 UI 会自动写 `[MoqiOverrides] version=3` 标记：有该标记时，
 `[Scheme_*]` 的 layout/marge/separator/anchor 一律视为用户手工高级项；
 没有该标记的旧文件在加载时会自动忽略“基准值 × 旧字号/基准字号”生成的布局键。
+旧版覆盖文件（无标记或 `version=2`）里的 `font_size` 是旧语义的“字体+整窗缩放”，
+加载时会自动换算为 `scale = old_font_size / base_font_size × 100`，并把字体大小
+恢复为皮肤自身的 `font_size`，因此升级后窗口尺寸与之前一致；设置 UI 保存时会写成
+新语义的 `font_size` + `scale` + `version=3`。
 
 `[Render]` 默认值就是旧版硬编码行为：`key_gap=1`、`item_spacing=11`、
 `pinyin_bold=1`、`text_offset_y=0`、`pinyin_separator=auto`
@@ -113,15 +122,19 @@ layout_mode=global
 ```ini
 [Options]
 statusbar=1
+statusbar_fullscreen_hide=1
+statusbar_fullscreen_scope=monitor
 horizontal=1
 statusbar_hide=
 ```
 
 - `statusbar=1/0`：显示/隐藏右下角常驻状态栏；修改后切换到另一个应用再回来即可生效。
+- `statusbar_fullscreen_hide=1/0`：前台窗口真正全屏（独占全屏、无边框全屏、浏览器 F11、视频全屏）时自动隐藏状态栏，默认 `1`；设为 `0` 完全恢复旧行为。桌面、普通窗口和最大化浏览器不会隐藏。
+- `statusbar_fullscreen_scope=monitor/all`：默认 `monitor`，只隐藏被全屏窗口覆盖的显示器上的状态栏；`all` 表示任何显示器全屏都隐藏全部状态栏。状态栏不会跟随鼠标移动。
 - `horizontal=1`：候选窗强制横排（H1）；`0` 使用 Moqi 的 `candidate_per_row` 设置（1 = 竖排 V1，>1 = 横排 H1）。
 - `statusbar_hide=biaodian,quan_ban,...`：按名字隐藏状态栏按钮（逗号分隔），用于皮肤本身没有 `_display=1`、但你想强制隐藏/显示的微调。
 - `statusbar_x` / `statusbar_y`：状态栏左上角坐标；留空或 `-1` 时使用屏幕右下角默认位置。
-- 也可以用环境变量 `MOQI_SOGOU_STATUSBAR=0/1`、`MOQI_SOGOU_HORIZONTAL=0/1` 覆盖。
+- 也可以用环境变量 `MOQI_SOGOU_STATUSBAR=0/1`、`MOQI_SOGOU_STATUSBAR_FULLSCREEN=0/1`、`MOQI_SOGOU_HORIZONTAL=0/1` 覆盖。
 
 快捷脚本：
 
@@ -133,7 +146,32 @@ statusbar_hide=
 
 皮肤模式下拼音串会画在候选窗皮肤上（类似官方行为），并自动关闭 Moqi 的 inline preedit，避免重复显示。
 
-字号现在由渲染器统一处理：`Theme::baseFontSize()` 保留皮肤在合并 overrides 前的 `[Display] font_size`，渲染时以 `effectiveFontSize / baseFontSize` 得到全局 `scale`（0.5–4.0），整个候选窗的背景 9-slice、文字、分隔线、候选 rect 一起等比放大；状态栏保持固定素材尺寸。Web 调参台与原生设置 UI 都只写 `[Display] font_size`，不再把 layout/marge/separator/anchor 按字号改写。
+字体大小与整窗缩放已经拆分：`Theme::baseFontSize()` 保留皮肤在合并 overrides 前的 `[Display] font_size`，`Display::fontSize` 是实际文字大小（设计像素），`Display::scalePercent` 是整窗缩放（50–300，默认 100）。渲染时 `scale = scalePercent / 100 × dpi / 96`，只对 9-slice 背景、边距、文字、分隔线和候选 rect 做统一变换；改变字体大小时只按文本测量增长候选行/窗口，不会把边距和背景按字体比例整体放大。100% 缩放 + 皮肤原生字体大小时输出与旧版完全一致。Web 调参台与原生设置 UI 都只写 `[Display] font_size` / `scale`，不再把 layout/marge/separator/anchor 按字号改写。
+
+## 按皮肤保存文字位置微调
+
+`%APPDATA%\Moqi\sogou_skin_layouts.ini` 保存每个皮肤自己的输入字/候选词偏移：
+
+```ini
+[MoqiLayouts]
+version=1
+
+[skin_4b85a907a8f7a3a0]
+preedit_x=20
+preedit_y=0
+candidate_x=0
+candidate_y=-15
+```
+
+- section 使用皮肤内容的稳定指纹：`.ssf` 对整个文件字节做 FNV-1a 64，解包目录对
+  `skin.ini` + 资源相对路径/大小清单做哈希。这样设置界面预览用的源文件和 IME
+  安装后的 `%APPDATA%\Moqi\sogou_skin.ssf` 副本会落到同一 section；不同皮肤
+  （包括只有图片不同的皮肤）不会串用偏移。
+- 偏移范围 -100..100 设计像素，默认 0；正值向右/向下。它只平移 `preeditRect`
+  和候选点击 rect，背景 9-slice 与窗口设计尺寸保持不动。偏移在全局缩放/DPI 变换
+  之前应用，因此 150%/200% 下会按同一比例正确换算。
+- 设置界面修改后实时预览、应用和切换皮肤都会反映；应用时写入当前皮肤的 section，
+  状态栏不受影响。
 
 ## 支持范围
 
@@ -147,6 +185,7 @@ statusbar_hide=
 - 合窗口的 `pinyin_marge` / `zhongwen_marge` / `separator`
 - PNG/BMP 背景、遮罩、字体/颜色
 - 候选窗尺寸计算、候选点击命中（用皮肤布局的 rect）
+- 独立字体大小 / 整窗缩放（50–300%）与按皮肤保存的输入字/候选词 X/Y 微调
 - 拼音串绘制在候选窗皮肤上（`pinyin_marge` 位置），并关闭 inline preedit 避免重复
 - H1（横排）和 V1（竖排）自动选择：
   - `sogou_skin_options.ini` 的 `horizontal=1` 强制 H1
@@ -154,7 +193,7 @@ statusbar_hide=
 - 竖排模式已按官方逻辑去掉首行额外偏移
 - 如果皮肤只有 H2/V2，则回退到分窗口绘制
 - **常驻状态栏窗口**：读取 `[StatusBar]` 的 `bar.png` / `bar_mask.png`，在屏幕右下角显示；没有输入/没有候选时也显示，可拖动，支持按钮悬停态和 `statusbar=0/1` 开关
-- **单一前台状态栏**：每个 TSF 宿主进程最多只显示一个状态栏；状态栏每 150ms 校验当前前台窗口是否属于本进程（含父/owner 链、宿主子窗口），切换应用后旧窗口立即隐藏，切回该应用时由 `onSetFocus`/`onActivate` 重新显示。新应用没有皮肤状态栏（UWP、部分 Electron/特殊 TSF 宿主）时宁可不显示，也不会残留上一个应用的窗口
+- **单一前台状态栏**：每个 TSF 宿主进程最多只显示一个状态栏；状态栏每 150ms 校验当前前台窗口是否属于本进程（含父/owner 链、宿主子窗口），切换应用后旧窗口立即隐藏，切回该应用时由 `onSetFocus`/`onActivate` 重新显示。新应用没有皮肤状态栏（UWP、部分 Electron/特殊 TSF 宿主）时宁可不显示，也不会残留上一个应用的窗口。前台窗口真正全屏时（`SogouSkinFullscreen.*`：DWM 可见边界 + `SHQueryUserNotificationState` + 窗口样式）状态栏以 400ms 低频 timer 保持隐藏，退出全屏后自动恢复；默认只隐藏全屏窗口覆盖的显示器，Windows 搜索、任务管理器最大化、自动隐藏任务栏下的最大化浏览器和桌面都不会误隐藏
 - **u 模式/拼字模式 preedit**：Rime `radical_lookup` 的 `prefix: u` 会在识别后吞掉组合串里的 `u`；前端跟踪空闲状态下以 `u` 开始的原始按键，在候选窗 preedit 显示 `u'...` 并追加 `[拼字]`（例如 `u'shui'shang[拼字]`）。只影响候选窗显示，不改变后端 composition/提交逻辑；按 Enter 仍沿用 Rime 的原始输入提交行为
 - **状态栏按钮状态**：`cn_en`/`quan_ban` 直接映射到后端 `switch-lang`/`switch-shape` 语言栏按钮，按 `chi.ico`/`eng.ico`、`full.ico`/`half.ico` 判断当前状态；快捷键 Shift、Shift+Space 切换后，状态栏图标会在 150ms 内跟随更新
 - **状态栏右键菜单**：右键状态栏可打开快捷菜单，包含中英文、全半角、中英标点、简繁、软键盘、**符号输入**（常用标点/数学符号/货币单位/特殊符号，通过 TSF 编辑会话插入），以及候选横排/竖排、状态栏显隐、皮肤设置、重新加载皮肤
@@ -184,12 +223,14 @@ statusbar_hide=
 功能：
 
 - 换肤：列出 `%APPDATA%\Moqi\skins`、`%APPDATA%\Moqi` 和搜狗皮肤编辑器目录下的 `.ssf`，也可浏览任意 `.ssf`
-- 字号：8–72 滑块；只写 `[Display] font_size`，渲染器按 `effectiveFontSize / baseFontSize` 对整个候选窗做等比缩放（背景/边框/人物图/文字/分隔线），状态栏不缩放
+- 缩放：50%–300% 滑块，控制整套皮肤/候选窗的全局缩放；默认 100%，不改变皮肤原生字体大小
+- 字体大小：8–72 滑块，只改变文字大小；文字变大时候选行/窗口按测量结果增长，但 9-slice/边距不会乘字体比例
+- 文字位置微调：输入字 X/Y、候选词 X/Y 四个带 Up-Down 步进的数值框（-100..100 设计像素，步长 1），按当前皮肤独立保存到 `sogou_skin_layouts.ini`，实时预览、应用和切换皮肤都会反映
 - 字体颜色：拼音、首选候选、候选文字、注释四组颜色（Windows 颜色选择器）
 - 状态栏：显示/隐藏状态栏、逐个勾选要显示的皮肤按钮
-- 应用后写 `sogou_skin_overrides.ini` / `sogou_skin_options.ini`，并向所有皮肤状态栏广播
+- 应用后写 `sogou_skin_overrides.ini` / `sogou_skin_options.ini` / `sogou_skin_layouts.ini`，并向所有皮肤状态栏广播
   `WM_MOQI_SOGOU_SETTINGS_CHANGED`，正在运行的输入法会立即重载皮肤，不需要重启应用
-- 旧版设置 UI 曾把 `[Scheme_*]` 的 layout/marge/separator/anchor 按字号缩放后写入 overrides；旧版 Web 调参台还会缩放状态栏 `_pos`。新版保存时会按“皮肤基准值 × 旧字号/基准字号”识别并删除这些自动生成的布局键与状态栏坐标，保留手工高级项，并写入 `[MoqiOverrides] version=2 / layout_mode=global` 标记；渲染器在加载无标记的旧文件时也会自动忽略这些旧缩放键，避免与全局 scale 叠加
+- 旧版设置 UI 曾把 `[Scheme_*]` 的 layout/marge/separator/anchor 按字号缩放后写入 overrides；旧版 Web 调参台还会缩放状态栏 `_pos`。新版保存时会按“皮肤基准值 × 旧字号/基准字号”识别并删除这些自动生成的布局键与状态栏坐标，保留手工高级项，并写入 `[MoqiOverrides] version=3 / layout_mode=global` 标记；渲染器在加载无标记或 version=2 的旧文件时也会自动把旧 `font_size` 迁移为新的 `scale`，避免与全局缩放叠加或改变老用户窗口尺寸
 
 ## 图形化调参台
 
@@ -245,6 +286,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Rele
 
 # 可选：真实窗口级状态栏前台切换冒烟测试
 .\build-vs64-local\SogouSkinTools\Release\SogouLogicTest.exe --statusbar-smoke
+
+# 可选：全屏隐藏/恢复/关闭开关冒烟测试（会短暂创建全屏 popup）
+.\build-vs64-local\SogouSkinTools\Release\SogouLogicTest.exe --statusbar-fullscreen-smoke
 
 # 可选：如果 MoqiWebView2TestHost 正在运行，检查 WebView2 宿主/渲染子进程归属
 .\build-vs64-local\SogouSkinTools\Release\SogouLogicTest.exe --webview-check

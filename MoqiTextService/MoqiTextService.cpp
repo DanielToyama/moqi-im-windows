@@ -98,6 +98,13 @@ void SaveSogouOptions(const SogouSkin::Options& options) {
 	file << "statusbar=" << (options.statusbar ? 1 : 0) << "\n";
 	file << "horizontal=" << (options.horizontal ? 1 : 0) << "\n";
 	file << "key_repeat=" << (options.keyRepeat ? 1 : 0) << "\n";
+	file << "statusbar_fullscreen_hide="
+	     << (options.statusbarFullscreenHide ? 1 : 0) << "\n";
+	file << "statusbar_fullscreen_scope="
+	     << (options.statusbarFullscreenScope == SogouSkin::FullscreenScope::All
+	             ? "all"
+	             : "monitor")
+	     << "\n";
 	file << "statusbar_hide=" << hidden << "\n";
 	if (options.statusbarX >= 0) {
 		file << "statusbar_x=" << options.statusbarX << "\n";

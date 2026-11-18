@@ -11,6 +11,7 @@ namespace {
 
 constexpr UINT_PTR kStateTimerId = 1;
 constexpr UINT kStateTimerIntervalMs = 150;
+constexpr UINT kSuppressedTimerIntervalMs = 400;
 
 bool WindowProcessId(HWND hwnd, DWORD* processId) {
     if (!hwnd || !processId) {
@@ -170,12 +171,21 @@ StatusBarForegroundPolicy::StatusBarForegroundPolicy(DWORD ownerProcessId,
     : ownerProcessId_(ownerProcessId), pendingGraceMs_(pendingGraceMs) {}
 
 StatusBarForegroundPolicy::Action StatusBarForegroundPolicy::requestShow(
-    HWND foreground, ULONGLONG now) {
+    HWND foreground, bool fullscreen, ULONGLONG now) {
     showRequested_ = true;
     if (WindowBelongsToProcess(foreground, ownerProcessId_)) {
         pendingDeadline_ = 0;
+        if (fullscreen) {
+            // Keep the request alive.  The status bar timer keeps polling at
+            // a low rate and shows the bar as soon as fullscreen ends, even if
+            // the game does not send another TSF focus event.
+            suppressed_ = true;
+            return Action::None;
+        }
+        suppressed_ = false;
         return Action::Show;
     }
+    suppressed_ = false;
     // TSF can deliver OnSetFocus/OnActivate just before Windows finishes the
     // foreground transition.  Poll briefly instead of either showing a stale
     // window or losing the focus event entirely.
@@ -184,15 +194,38 @@ StatusBarForegroundPolicy::Action StatusBarForegroundPolicy::requestShow(
 }
 
 StatusBarForegroundPolicy::Action StatusBarForegroundPolicy::evaluate(
-    HWND foreground, bool visible, ULONGLONG now) {
+    HWND foreground, bool fullscreen, bool visible, ULONGLONG now) {
+    const bool owned = WindowBelongsToProcess(foreground, ownerProcessId_);
     if (visible) {
-        if (WindowBelongsToProcess(foreground, ownerProcessId_)) {
-            return Action::None;
+        if (owned) {
+            // Fullscreen hides the window but intentionally keeps
+            // showRequested_ so leaving fullscreen restores it.
+            suppressed_ = fullscreen;
+            return fullscreen ? Action::Suppress : Action::None;
         }
         showRequested_ = false;
+        suppressed_ = false;
         pendingDeadline_ = 0;
         return Action::Hide;
     }
+
+    if (suppressed_) {
+        if (!owned) {
+            showRequested_ = false;
+            suppressed_ = false;
+            pendingDeadline_ = 0;
+            return Action::StopPolling;
+        }
+        if (fullscreen) {
+            // Keep the low-frequency timer alive while the game is
+            // fullscreen; it is what notices Alt+Enter / game exit.
+            return Action::None;
+        }
+        suppressed_ = false;
+        pendingDeadline_ = 0;
+        return Action::Show;
+    }
+
     if (!showRequested_ || pendingDeadline_ == 0) {
         // A bar that was successfully shown keeps pendingDeadline_ == 0.
         // If another status bar subsequently hides it (same-process TSF
@@ -203,7 +236,14 @@ StatusBarForegroundPolicy::Action StatusBarForegroundPolicy::evaluate(
         pendingDeadline_ = 0;
         return Action::StopPolling;
     }
-    if (WindowBelongsToProcess(foreground, ownerProcessId_)) {
+    if (owned) {
+        if (fullscreen) {
+            // The foreground transition completed into a fullscreen window;
+            // keep the pending request alive but do not flash the bar.
+            suppressed_ = true;
+            pendingDeadline_ = 0;
+            return Action::None;
+        }
         pendingDeadline_ = 0;
         return Action::Show;
     }
@@ -217,6 +257,7 @@ StatusBarForegroundPolicy::Action StatusBarForegroundPolicy::evaluate(
 
 void StatusBarForegroundPolicy::clear() {
     showRequested_ = false;
+    suppressed_ = false;
     pendingDeadline_ = 0;
 }
 
@@ -284,26 +325,35 @@ void StatusBarWindow::show() {
     if (!hwnd_) {
         return;
     }
-    const auto action = foregroundPolicy_.requestShow(
-        ::GetForegroundWindow(), ::GetTickCount64());
+    refreshFullscreenOptions();
+    const HWND foreground = ::GetForegroundWindow();
+    const ULONGLONG now = ::GetTickCount64();
+    const bool fullscreen = sampleFullscreen(foreground, true);
+    const auto action =
+        foregroundPolicy_.requestShow(foreground, fullscreen, now);
     if (action == StatusBarForegroundPolicy::Action::Show) {
+        setStateTimerInterval(kStateTimerIntervalMs);
         showNow();
         return;
     }
     // The foreground transition may not be visible to GetForegroundWindow()
-    // yet.  Stay hidden and let the timer finish the election shortly after.
+    // yet, or the foreground may be a fullscreen app.  Stay hidden and let
+    // the timer finish the election shortly after.
     if (::IsWindowVisible(hwnd_)) {
         ::ShowWindow(hwnd_, SW_HIDE);
         if (onVisibilityChanged_) {
             onVisibilityChanged_(false);
         }
     }
+    setStateTimerInterval(fullscreen ? kSuppressedTimerIntervalMs
+                                     : kStateTimerIntervalMs);
     ensureStateTimer();
 }
 
 void StatusBarWindow::hide() {
     foregroundPolicy_.clear();
     stopStateTimer();
+    setStateTimerInterval(kStateTimerIntervalMs);
     if (hwnd_) {
         const bool wasVisible = ::IsWindowVisible(hwnd_) != FALSE;
         ::ShowWindow(hwnd_, SW_HIDE);
@@ -317,15 +367,68 @@ void StatusBarWindow::checkForegroundNow() {
     if (!hwnd_) {
         return;
     }
-    const auto action = foregroundPolicy_.evaluate(
-        ::GetForegroundWindow(), isVisible(), ::GetTickCount64());
+    const HWND foreground = ::GetForegroundWindow();
+    const ULONGLONG now = ::GetTickCount64();
+    const bool fullscreen = sampleFullscreen(foreground, true);
+    const auto action =
+        foregroundPolicy_.evaluate(foreground, fullscreen, isVisible(), now);
     if (action == StatusBarForegroundPolicy::Action::Hide) {
         hide();
+    } else if (action == StatusBarForegroundPolicy::Action::Suppress) {
+        suppressForFullscreen();
     } else if (action == StatusBarForegroundPolicy::Action::Show) {
+        setStateTimerInterval(kStateTimerIntervalMs);
         showNow();
     } else if (action == StatusBarForegroundPolicy::Action::StopPolling &&
                !isVisible()) {
         stopStateTimer();
+    }
+}
+
+void StatusBarWindow::suppressForFullscreen() {
+    if (!hwnd_) {
+        return;
+    }
+    const bool wasVisible = ::IsWindowVisible(hwnd_) != FALSE;
+    if (wasVisible) {
+        ::ShowWindow(hwnd_, SW_HIDE);
+        if (onVisibilityChanged_) {
+            onVisibilityChanged_(false);
+        }
+    }
+    // Keep showRequested_ intact and keep a low-frequency timer running so
+    // the bar returns after Alt+Enter / leaving the fullscreen app.
+    setStateTimerInterval(kSuppressedTimerIntervalMs);
+    ensureStateTimer();
+}
+
+void StatusBarWindow::refreshFullscreenOptions() {
+    const auto options = LoadOptions();
+    fullscreenHideEnabled_ = options.statusbarFullscreenHide;
+    fullscreenScope_ = options.statusbarFullscreenScope;
+    fullscreenDetector_.setOptions(fullscreenHideEnabled_, fullscreenScope_);
+}
+
+bool StatusBarWindow::sampleFullscreen(HWND foreground, bool force) {
+    if (!hwnd_ || !fullscreenHideEnabled_) {
+        return false;
+    }
+    return fullscreenDetector_.update(foreground, hwnd_, ::GetTickCount64(),
+                                      force);
+}
+
+void StatusBarWindow::setStateTimerInterval(UINT intervalMs) {
+    if (intervalMs == 0) {
+        intervalMs = kStateTimerIntervalMs;
+    }
+    if (stateTimerIntervalMs_ == intervalMs) {
+        return;
+    }
+    stateTimerIntervalMs_ = intervalMs;
+    if (hwnd_ && stateTimer_) {
+        ::KillTimer(hwnd_, kStateTimerId);
+        stateTimer_ =
+            ::SetTimer(hwnd_, kStateTimerId, stateTimerIntervalMs_, nullptr);
     }
 }
 
@@ -341,6 +444,7 @@ void StatusBarWindow::showNow() {
     }
     ::SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    setStateTimerInterval(kStateTimerIntervalMs);
     ensureStateTimer();
     if (!wasVisible && onVisibilityChanged_) {
         onVisibilityChanged_(true);
@@ -349,7 +453,8 @@ void StatusBarWindow::showNow() {
 
 void StatusBarWindow::ensureStateTimer() {
     if (hwnd_ && !stateTimer_) {
-        stateTimer_ = ::SetTimer(hwnd_, kStateTimerId, kStateTimerIntervalMs, nullptr);
+        stateTimer_ = ::SetTimer(hwnd_, kStateTimerId, stateTimerIntervalMs_,
+                                 nullptr);
     }
 }
 
@@ -561,6 +666,7 @@ LRESULT CALLBACK StatusBarWindow::staticWndProc(HWND hwnd, UINT msg, WPARAM wp, 
 LRESULT StatusBarWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOQI_SOGOU_SETTINGS_CHANGED:
+        refreshFullscreenOptions();
         if (onSettingsChanged_) {
             onSettingsChanged_();
         }
@@ -572,10 +678,17 @@ LRESULT StatusBarWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
             // creating its own bar (UWP, Electron subprocesses, unusual TSF
             // lifecycles), so hiding only when a new bar appears leaves the
             // old application's window on screen.
+            const HWND foreground = ::GetForegroundWindow();
+            const ULONGLONG now = ::GetTickCount64();
+            const bool fullscreen = sampleFullscreen(foreground, false);
             const auto action = foregroundPolicy_.evaluate(
-                ::GetForegroundWindow(), isVisible(), ::GetTickCount64());
+                foreground, fullscreen, isVisible(), now);
             if (action == StatusBarForegroundPolicy::Action::Hide) {
                 hide();
+                return 0;
+            }
+            if (action == StatusBarForegroundPolicy::Action::Suppress) {
+                suppressForFullscreen();
                 return 0;
             }
             if (action == StatusBarForegroundPolicy::Action::StopPolling) {
@@ -583,6 +696,7 @@ LRESULT StatusBarWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (action == StatusBarForegroundPolicy::Action::Show) {
+                setStateTimerInterval(kStateTimerIntervalMs);
                 showNow();
             }
             if (!isVisible()) {
@@ -604,6 +718,20 @@ LRESULT StatusBarWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+    case WM_SETTINGCHANGE:
+        // Presentation mode, taskbar auto-hide and work-area changes do not
+        // change the foreground HWND; force a fresh fullscreen sample.
+        fullscreenDetector_.invalidate();
+        checkForegroundNow();
+        return 0;
+    case WM_DISPLAYCHANGE:
+        // Resolution changes (Alt+Enter) invalidate the cached frame and can
+        // move the status bar's work area.
+        fullscreenDetector_.invalidate();
+        positionAtCorner();
+        refresh();
+        checkForegroundNow();
+        return 0;
     case WM_PAINT:
         paint();
         return 0;
@@ -614,6 +742,8 @@ LRESULT StatusBarWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
             updateSizeForDpi();
             positionAtCorner();
             refresh();
+            fullscreenDetector_.invalidate();
+            checkForegroundNow();
         }
         return 0;
     }

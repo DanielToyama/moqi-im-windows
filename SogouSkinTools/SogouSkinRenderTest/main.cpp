@@ -5,13 +5,22 @@
 //                       [preedit] [candidate|candidate|...]
 //                       [key-gap] [item-spacing] [text-offset-y]
 //                       [pinyin-bold 0|1] [cand-per-row] [white|transparent]
-//                       [--dpi N]
+//                       [--dpi N] [--font-size N] [--scale PERCENT]
+//                       [--legacy-font-size N]
+//                       [--preedit-x N] [--preedit-y N]
+//                       [--cand-x N] [--cand-y N]
 //
 // `--dpi` defaults to 0, which derives the effective DPI from the screen DC
 // (96 in a DPI-unaware process).  Pass 120/144/168/192 to test the Windows
 // 125/150/175/200% scale factors without changing the desktop.  It is a flag
 // rather than a positional argument so it does not switch on the optional
 // [Render] override profile used by the reference-render commands.
+//
+// `--font-size` writes the new independent [Display] font_size; `--scale`
+// writes [Display] scale as a percentage.  `--legacy-font-size` writes the
+// old combined font+window font_size without a version marker so the
+// migration path can be verified.  The four nudge options call
+// Theme::setLayout() before measuring, mirroring the settings preview.
 //
 // It deliberately creates no visible window, so it is safe to run in the
 // background while iterating.  Optional arguments let the audit harness feed
@@ -248,9 +257,35 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<wchar_t*> positional;
     positional.push_back(argv[0]);
     int dpiArg = 0;
+    int fontPixelArg = 0;
+    int scalePercentArg = 0;
+    int legacyFontSizeArg = 0;
+    Moqi::SogouSkin::SkinLayout nudges;
     for (int i = 1; i < argc; ++i) {
-        if (_wcsicmp(argv[i], L"--dpi") == 0 && i + 1 < argc) {
+        const bool hasValue = i + 1 < argc;
+        if (_wcsicmp(argv[i], L"--dpi") == 0 && hasValue) {
             dpiArg = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--font-size") == 0 && hasValue) {
+            fontPixelArg = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--scale") == 0 && hasValue) {
+            scalePercentArg = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--legacy-font-size") == 0 && hasValue) {
+            legacyFontSizeArg = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--preedit-x") == 0 && hasValue) {
+            nudges.preeditX = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--preedit-y") == 0 && hasValue) {
+            nudges.preeditY = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--cand-x") == 0 && hasValue) {
+            nudges.candidateX = IntArg(argc, argv, i + 1, 0);
+            ++i;
+        } else if (_wcsicmp(argv[i], L"--cand-y") == 0 && hasValue) {
+            nudges.candidateY = IntArg(argc, argv, i + 1, 0);
             ++i;
         } else {
             positional.push_back(argv[i]);
@@ -262,7 +297,9 @@ int wmain(int argc, wchar_t** argv) {
         std::wcerr << L"usage: SogouSkinRenderTest <skin-dir-or-ssf> <H1|V1|H2|V2> <out.png>\n"
                       L"       [preedit] [candidate|candidate|...] [key-gap] [item-spacing]\n"
                       L"       [text-offset-y] [pinyin-bold] [cand-per-row] [white|transparent]\n"
-                      L"       [--dpi 120|144|168|192]\n";
+                      L"       [--dpi 120|144|168|192] [--font-size N] [--scale PERCENT]\n"
+                      L"       [--legacy-font-size N]\n"
+                      L"       [--preedit-x N] [--preedit-y N] [--cand-x N] [--cand-y N]\n";
         return 2;
     }
     const std::wstring skinPath = argv[1];
@@ -291,13 +328,28 @@ int wmain(int argc, wchar_t** argv) {
     const bool hadAppData =
         ::GetEnvironmentVariableW(L"APPDATA", oldAppData, _countof(oldAppData)) > 0;
     std::wstring tempAppData;
-    if (argc > 6) {
+    if (argc > 6 || fontPixelArg > 0 || scalePercentArg > 0 ||
+        legacyFontSizeArg > 0 || nudges.preeditX != 0 || nudges.preeditY != 0 ||
+        nudges.candidateX != 0 || nudges.candidateY != 0) {
         tempAppData = MakeTempAppData();
         std::wstring ini = L"[Render]\n";
         ini += L"key_gap=" + std::to_wstring(keyGap) + L"\n";
         ini += L"item_spacing=" + std::to_wstring(itemSpacing) + L"\n";
         ini += L"text_offset_y=" + std::to_wstring(textOffsetY) + L"\n";
         ini += L"pinyin_bold=" + std::to_wstring(pinyinBold) + L"\n";
+        if (legacyFontSizeArg > 0) {
+            ini += L"[Display]\nfont_size=" +
+                   std::to_wstring(legacyFontSizeArg) + L"\n";
+        } else if (fontPixelArg > 0 || scalePercentArg > 0) {
+            ini += L"[Display]\n";
+            if (fontPixelArg > 0) {
+                ini += L"font_size=" + std::to_wstring(fontPixelArg) + L"\n";
+            }
+            if (scalePercentArg > 0) {
+                ini += L"scale=" + std::to_wstring(scalePercentArg) + L"\n";
+            }
+            ini += L"[MoqiOverrides]\nversion=3\n";
+        }
         WriteFileUtf8(tempAppData + L"\\Moqi\\sogou_skin_overrides.ini", ini);
         _wputenv_s(L"APPDATA", tempAppData.c_str());
     }
@@ -309,9 +361,19 @@ int wmain(int argc, wchar_t** argv) {
         Gdiplus::GdiplusShutdown(token);
         return 1;
     }
+    if (nudges.preeditX != 0 || nudges.preeditY != 0 ||
+        nudges.candidateX != 0 || nudges.candidateY != 0) {
+        theme->setLayout(nudges);
+    }
+    std::wcout << L"skin.id=" << theme->skinId() << L"\n";
     std::wcout << L"font.base=" << theme->baseFontSize()
                << L" font.effective=" << theme->display().fontSize
+               << L" scale.percent=" << theme->display().scalePercent
                << L" render.item_spacing=" << theme->render().itemSpacing << L"\n";
+    std::wcout << L"layout.preedit=" << theme->layout().preeditX << L","
+               << theme->layout().preeditY << L" layout.candidate="
+               << theme->layout().candidateX << L","
+               << theme->layout().candidateY << L"\n";
     std::wcout << L"overrides.path=" << Moqi::SogouSkin::OverridesPath() << L"\n";
 
     if (schemeName == L"StatusBar" || schemeName == L"STATUS") {
@@ -397,6 +459,8 @@ int wmain(int argc, wchar_t** argv) {
                            : (Contains(schemeName, L"H") ? 3 : 1);
 
     Moqi::SogouSkin::Renderer renderer(theme, dpiArg);
+    std::wcout << L"renderer.font_px=" << renderer.designFontPixelSize()
+               << L" renderer.scale=" << renderer.scale() << L"\n";
     HDC screen = ::GetDC(nullptr);
     const auto layout = renderer.measure(state, screen);
     ::ReleaseDC(nullptr, screen);

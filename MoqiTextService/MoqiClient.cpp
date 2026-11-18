@@ -775,30 +775,14 @@ void Client::updateCommitString(Json::Value &msg, Ime::EditSession *session,
     const bool autoPairQuotesEnabled = textService_->autoPairQuotes();
     std::wstring commitString = rawCommitString;
     // In u-mode, Enter is the "temporary English word" escape.  Rime commits
-    // the raw lookup input (e.g. ushui); strip only the leading u and keep the
-    // rest of the typed word.  Chinese candidate commits do not match the raw
-    // tracked input and are left untouched.
+    // the raw lookup input (e.g. ushui); strip only the leading u consumed by
+    // affix_segmentor and keep the rest of the typed word.  A lone `u` has no
+    // lookup body, so it is committed intact.  Chinese candidate commits do
+    // not match the raw tracked input and are left untouched.
     const std::wstring uModeRaw = uModeCommitRaw_;
     uModeCommitRaw_.clear();
-    auto normalizeUModeText = [](const std::wstring& text) {
-      std::wstring result;
-      result.reserve(text.size());
-      for (wchar_t ch : text) {
-        if (ch != L'\'' && ch != L' ' && ch != L'\t') {
-          result.push_back(ch);
-        }
-      }
-      return result;
-    };
-    if (!uModeRaw.empty() && uModeRaw[0] == L'u' && !commitString.empty() &&
-        commitString[0] == L'u' &&
-        normalizeUModeText(commitString) == normalizeUModeText(uModeRaw)) {
-      commitString.erase(commitString.begin());
-      while (!commitString.empty() &&
-             (commitString.front() == L'\'' || commitString.front() == L' ' ||
-              commitString.front() == L'\t')) {
-        commitString.erase(commitString.begin());
-      }
+    if (!uModeRaw.empty()) {
+      commitString = ApplyUModeEnterCommit(uModeRaw, commitString);
     }
     std::wstring pairedCommitString;
     const bool isAutoPairSymbol =
@@ -1232,11 +1216,21 @@ void Client::updateCandidateList(Json::Value &msg, Ime::EditSession *session) {
       !utf8ToUtf16(msg["commitString"].asCString()).empty();
   const bool uModeActive =
       !uModeTracker_.rawInput().empty() && !hasCommitPayload;
+  // Ordinary compositions with zero candidates (e.g. an invalid i-prefixed
+  // pinyin string) still own a preedit.  Keep the preedit-only window while
+  // the backend reports a composition, otherwise the candidate box vanishes
+  // on the first key that has no candidates.
+  const bool hasCompositionPayload =
+      msg["compositionString"].isString() &&
+      !utf8ToUtf16(msg["compositionString"].asCString()).empty();
+  const bool keepPreeditWindow = ShouldKeepPreeditWindow(
+      hasCompositionPayload, textService_->effectiveExternalPreedit(),
+      uModeActive);
   const bool shouldRestoreCandidates =
       hasVisibleCandidates && hasCandidateRecoveryState &&
       (!hasExplicitShowCandidates || !explicitShowCandidates);
   const bool shouldShowCandidates =
-      explicitShowCandidates || shouldRestoreCandidates || uModeActive;
+      explicitShowCandidates || shouldRestoreCandidates || keepPreeditWindow;
 
   const unsigned long long parseEnd = qpcMicros();
   unsigned long long showStart = parseEnd;
@@ -1263,12 +1257,12 @@ void Client::updateCandidateList(Json::Value &msg, Ime::EditSession *session) {
     const bool hideBecauseExplicit =
         hasExplicitShowCandidates && !explicitShowCandidates &&
         !shouldRestoreCandidates;
-    if (!uModeActive && (hideBecauseEmpty || hideBecauseExplicit)) {
+    if (!keepPreeditWindow && (hideBecauseEmpty || hideBecauseExplicit)) {
       textService_->hideCandidates();
     }
     hideEnd = qpcMicros();
   } else if (hasExplicitShowCandidates && !explicitShowCandidates &&
-             !uModeActive) {
+             !keepPreeditWindow) {
     textService_->hideCandidates();
     hideEnd = qpcMicros();
   }

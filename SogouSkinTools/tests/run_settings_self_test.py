@@ -80,7 +80,8 @@ def main() -> int:
     )
     # Options owned by another screen must survive a settings apply.
     (appdata / "Moqi" / "sogou_skin_options.ini").write_text(
-        "[Options]\nstatusbar=1\nhorizontal=0\nkey_repeat=0\nstatusbar_hide=\n",
+        "[Options]\nstatusbar=1\nstatusbar_fullscreen_hide=0\n"
+        "statusbar_fullscreen_scope=all\nhorizontal=0\nkey_repeat=0\nstatusbar_hide=\n",
         encoding="ascii",
     )
 
@@ -107,6 +108,7 @@ def main() -> int:
     env["PROGRAMFILES"] = str(program_files)
     env.pop("MOQI_SOGOU_SKIN", None)
     env.pop("MOQI_SOGOU_STATUSBAR", None)
+    env.pop("MOQI_SOGOU_STATUSBAR_FULLSCREEN", None)
 
     started = time.time()
     result = subprocess.run(
@@ -126,7 +128,13 @@ def main() -> int:
     options_path = appdata / "Moqi" / "sogou_skin_options.ini"
     options_text = options_path.read_text(encoding="ascii", errors="replace") if options_path.is_file() else ""
     key_repeat_preserved = "key_repeat=0" in options_text
+    fullscreen_hide_preserved = "statusbar_fullscreen_hide=0" in options_text
+    fullscreen_scope_preserved = "statusbar_fullscreen_scope=all" in options_text
     print(f"key_repeat_preserved={'PASS' if key_repeat_preserved else 'FAIL'}")
+    print(
+        "fullscreen_options_preserved="
+        f"{'PASS' if fullscreen_hide_preserved and fullscreen_scope_preserved else 'FAIL'}"
+    )
     print(f"exit_code={result.returncode} elapsed={elapsed:.1f}s")
     expected = [
         "combo_count=3",
@@ -141,6 +149,8 @@ def main() -> int:
         and all(item in log for item in expected)
         and "gone.ssf" not in log
         and key_repeat_preserved
+        and fullscreen_hide_preserved
+        and fullscreen_scope_preserved
     )
     print("settings_self_test=PASS" if ok else "settings_self_test=FAIL")
     return 0 if ok else 1

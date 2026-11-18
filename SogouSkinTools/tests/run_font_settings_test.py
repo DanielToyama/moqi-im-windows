@@ -163,6 +163,7 @@ def main() -> int:
     env["PROGRAMFILES"] = str(program_files)
     env.pop("MOQI_SOGOU_SKIN", None)
     env.pop("MOQI_SOGOU_STATUSBAR", None)
+    env.pop("MOQI_SOGOU_STATUSBAR_FULLSCREEN", None)
 
     started = time.time()
     result = subprocess.run(
@@ -199,6 +200,8 @@ def main() -> int:
     checks["overrides_font_ch"] = "font_ch=微软雅黑" in overrides
     checks["overrides_font_en"] = "font_en=Arial" in overrides
     checks["overrides_font_size_24"] = "font_size=24" in overrides
+    checks["overrides_scale_100"] = "scale=100" in overrides
+    checks["overrides_version_3"] = "version=3" in overrides
     checks["overrides_utf16le"] = overrides_path.is_file() and overrides_path.read_bytes().startswith(b"\xff\xfe")
     checks["manual_field_preserved"] = "keep_me=1" in overrides
 

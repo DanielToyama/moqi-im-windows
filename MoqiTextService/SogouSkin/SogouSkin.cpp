@@ -451,6 +451,141 @@ bool HasGlobalLayoutMarker(const IniSectionMap& sections) {
     return ToLower(GetString(section, L"layout_mode")) == L"global";
 }
 
+// Version 3 introduced independent [Display] font_size (actual text size) and
+// scale (whole-skin percent).  Older files used font_size as a single
+// font-and-window multiplier.  A hand-written file that already contains
+// `scale` is treated as new-format even without the marker.
+bool HasExplicitScale(const IniSectionMap& sections) {
+    const auto it = sections.find(L"display");
+    return it != sections.end() &&
+           it->second.find(L"scale") != it->second.end();
+}
+
+bool HasNewFontScaleSemantics(const IniSectionMap& sections) {
+    if (HasExplicitScale(sections)) {
+        return true;
+    }
+    const auto it = sections.find(L"moqi_overrides");
+    return it != sections.end() && GetInt(it->second, L"version", 0) >= 3;
+}
+
+int ScalePercentFromLegacyFontSize(int oldFontSize, int baseFontSize) {
+    if (baseFontSize <= 0) {
+        return 100;
+    }
+    const double ratio =
+        static_cast<double>(std::max(1, oldFontSize)) / baseFontSize;
+    return std::clamp(static_cast<int>(std::lround(ratio * 100.0)),
+                      kMinScalePercent, kMaxScalePercent);
+}
+
+int ClampLayoutOffset(int value) {
+    return std::clamp(value, -100, 100);
+}
+
+SkinLayout ClampLayout(SkinLayout layout) {
+    layout.preeditX = ClampLayoutOffset(layout.preeditX);
+    layout.preeditY = ClampLayoutOffset(layout.preeditY);
+    layout.candidateX = ClampLayoutOffset(layout.candidateX);
+    layout.candidateY = ClampLayoutOffset(layout.candidateY);
+    return layout;
+}
+
+unsigned long long Fnv1a(const void* data, size_t size,
+                         unsigned long long hash = 1469598103934665603ULL) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::wstring FormatSkinId(unsigned long long hash) {
+    wchar_t buffer[32] = {};
+    swprintf_s(buffer, L"skin_%016llx", hash);
+    return buffer;
+}
+
+std::wstring SkinIdFromBytes(const std::vector<unsigned char>& bytes) {
+    return FormatSkinId(Fnv1a(bytes.data(), bytes.size()));
+}
+
+void CollectSkinFiles(const std::wstring& root, const std::wstring& relative,
+                      int depth,
+                      std::vector<std::pair<std::wstring, unsigned long long>>* out) {
+    if (!out || depth > 4) {
+        return;
+    }
+    const std::wstring pattern =
+        JoinPath(relative.empty() ? root : JoinPath(root, relative), L"*");
+    WIN32_FIND_DATAW data = {};
+    HANDLE find = ::FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        const std::wstring name = data.cFileName;
+        if (name == L"." || name == L"..") {
+            continue;
+        }
+        const std::wstring childRelative =
+            relative.empty() ? name : relative + L"\\" + name;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            CollectSkinFiles(root, childRelative, depth + 1, out);
+            continue;
+        }
+        if (relative.empty() && ToLower(name) == L"skin.ini") {
+            continue;
+        }
+        std::wstring normalized = ToLower(childRelative);
+        std::replace(normalized.begin(), normalized.end(), L'\\', L'/');
+        const unsigned long long size =
+            (static_cast<unsigned long long>(data.nFileSizeHigh) << 32) |
+            data.nFileSizeLow;
+        out->emplace_back(normalized, size);
+    } while (::FindNextFileW(find, &data));
+    ::FindClose(find);
+}
+
+// The section id must identify one skin, not one filesystem location: the IME
+// installs archives as %APPDATA%\Moqi\sogou_skin.ssf.  Archives therefore hash
+// their bytes (the copied file is byte-identical), while extracted directories
+// hash skin.ini plus the relative name/size inventory of their assets.
+std::wstring SkinIdFromContent(
+    const std::vector<unsigned char>& iniBytes,
+    std::vector<std::pair<std::wstring, unsigned long long>> files) {
+    unsigned long long hash = Fnv1a(iniBytes.data(), iniBytes.size());
+    std::sort(files.begin(), files.end());
+    for (const auto& [name, size] : files) {
+        const std::wstring marker = name + L"\n";
+        hash = Fnv1a(marker.data(), marker.size() * sizeof(wchar_t), hash);
+        hash = Fnv1a(&size, sizeof(size), hash);
+    }
+    return FormatSkinId(hash);
+}
+
+std::string Utf16LeBytes(const std::wstring& text) {
+    std::string bytes;
+    bytes.reserve(text.size() * 2 + 2);
+    bytes.push_back(static_cast<char>(0xFF));
+    bytes.push_back(static_cast<char>(0xFE));
+    for (wchar_t ch : text) {
+        bytes.push_back(static_cast<char>(ch & 0xFF));
+        bytes.push_back(static_cast<char>((ch >> 8) & 0xFF));
+    }
+    return bytes;
+}
+
+bool WriteAllBytes(const std::wstring& path, const std::string& data) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    file.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return file.good();
+}
+
 std::wstring FormatIntList(const int* values, int count) {
     std::wstring result;
     for (int i = 0; i < count; ++i) {
@@ -702,6 +837,75 @@ std::wstring InstalledSkinPath() {
     return dir.empty() ? std::wstring() : JoinPath(dir, L"sogou_skin.ssf");
 }
 
+std::wstring SkinLayoutsPath() {
+    const std::wstring dir = MoqiConfigDirectory();
+    return dir.empty() ? std::wstring()
+                       : JoinPath(dir, L"sogou_skin_layouts.ini");
+}
+
+SkinLayout LoadSkinLayoutOffsets(const std::wstring& skinId) {
+    SkinLayout layout;
+    if (skinId.empty()) {
+        return layout;
+    }
+    IniSectionMap sections;
+    if (!ReadOverrideSections(SkinLayoutsPath(), &sections)) {
+        return layout;
+    }
+    const auto it = sections.find(ToLower(skinId));
+    if (it == sections.end()) {
+        return layout;
+    }
+    const auto& section = it->second;
+    layout.preeditX = GetInt(section, L"preedit_x", 0);
+    layout.preeditY = GetInt(section, L"preedit_y", 0);
+    layout.candidateX = GetInt(section, L"candidate_x", 0);
+    layout.candidateY = GetInt(section, L"candidate_y", 0);
+    return ClampLayout(layout);
+}
+
+std::wstring BuildSkinLayoutsText(const std::wstring& existingPath,
+                                  const std::wstring& skinId,
+                                  const SkinLayout& layout) {
+    IniSectionMap sections;
+    ReadOverrideSections(existingPath, &sections);
+    const SkinLayout clamped = ClampLayout(layout);
+    auto& marker = sections[L"moqi_layouts"];
+    marker[L"version"] = L"1";
+    if (!skinId.empty()) {
+        auto& section = sections[ToLower(skinId)];
+        section[L"preedit_x"] = std::to_wstring(clamped.preeditX);
+        section[L"preedit_y"] = std::to_wstring(clamped.preeditY);
+        section[L"candidate_x"] = std::to_wstring(clamped.candidateX);
+        section[L"candidate_y"] = std::to_wstring(clamped.candidateY);
+    }
+    std::wostringstream out;
+    for (const auto& [sectionName, values] : sections) {
+        if (values.empty()) {
+            continue;
+        }
+        out << L"[" << sectionName << L"]\n";
+        for (const auto& [key, value] : values) {
+            out << key << L"=" << value << L"\n";
+        }
+        out << L"\n";
+    }
+    return out.str();
+}
+
+bool SaveSkinLayoutOffsets(const std::wstring& skinId, const SkinLayout& layout) {
+    const std::wstring path = SkinLayoutsPath();
+    if (path.empty()) {
+        return false;
+    }
+    const std::wstring config = MoqiConfigDirectory();
+    if (!config.empty()) {
+        ::CreateDirectoryW(config.c_str(), nullptr);
+    }
+    return WriteAllBytes(path, Utf16LeBytes(
+                                  BuildSkinLayoutsText(path, skinId, layout)));
+}
+
 std::shared_ptr<Theme> Theme::Load(const std::wstring& path, std::wstring* error) {
     return LoadInternal(path, OverridesPath(), error);
 }
@@ -747,11 +951,18 @@ std::shared_ptr<Theme> Theme::LoadInternal(const std::wstring& path,
             theme->baseDir_ = slash == std::wstring::npos ? L"." : path.substr(0, slash);
             std::vector<unsigned char> data;
             if (ReadFileBytes(path, &data)) {
+                std::vector<std::pair<std::wstring, unsigned long long>> files;
+                CollectSkinFiles(theme->baseDir_, L"", 0, &files);
+                theme->skinId_ =
+                    SkinIdFromContent(data, std::move(files));
                 ok = theme->loadIni(DecodeIniText(data), error);
             }
         }
     }
     theme->valid_ = ok;
+    if (ok) {
+        theme->loadLayoutOffsets();
+    }
     if (!ok && error && error->empty()) {
         *error = L"未知加载错误";
     }
@@ -787,6 +998,13 @@ Options LoadOptions() {
                 } else if (key == L"key_repeat") {
                     options.keyRepeat = value != L"0" && value != L"false" &&
                                         value != L"off";
+                } else if (key == L"statusbar_fullscreen_hide") {
+                    options.statusbarFullscreenHide =
+                        value != L"0" && value != L"false" && value != L"off";
+                } else if (key == L"statusbar_fullscreen_scope") {
+                    options.statusbarFullscreenScope =
+                        value == L"all" ? FullscreenScope::All
+                                        : FullscreenScope::Monitor;
                 } else if (key == L"statusbar_hide") {
                     for (const auto& part : SplitComma(value)) {
                         const std::wstring name = ToLower(Trim(part));
@@ -806,6 +1024,13 @@ Options LoadOptions() {
     if (::GetEnvironmentVariableW(L"MOQI_SOGOU_STATUSBAR", value,
                                   _countof(value)) > 0) {
         options.statusbar = value[0] != L'0';
+    }
+    if (::GetEnvironmentVariableW(L"MOQI_SOGOU_STATUSBAR_FULLSCREEN", value,
+                                  _countof(value)) > 0) {
+        const std::wstring fullscreenValue = ToLower(value);
+        options.statusbarFullscreenHide =
+            fullscreenValue != L"0" && fullscreenValue != L"false" &&
+            fullscreenValue != L"off";
     }
     if (::GetEnvironmentVariableW(L"MOQI_SOGOU_HORIZONTAL", value,
                                   _countof(value)) > 0) {
@@ -876,6 +1101,14 @@ std::shared_ptr<Theme> LoadPreferredTheme(std::wstring* error, std::wstring* loa
 
 Theme::~Theme() = default;
 
+void Theme::setLayout(const SkinLayout& layout) {
+    layout_ = ClampLayout(layout);
+}
+
+void Theme::loadLayoutOffsets() {
+    layout_ = LoadSkinLayoutOffsets(skinId_);
+}
+
 bool Theme::loadFromDirectory(const std::wstring& dir, std::wstring* error) {
     baseDir_ = dir;
     const std::wstring iniPath = dir + L"\\skin.ini";
@@ -888,6 +1121,9 @@ bool Theme::loadFromDirectory(const std::wstring& dir, std::wstring* error) {
     }
     std::vector<unsigned char> data((std::istreambuf_iterator<char>(in)),
                                     std::istreambuf_iterator<char>());
+    std::vector<std::pair<std::wstring, unsigned long long>> files;
+    CollectSkinFiles(dir, L"", 0, &files);
+    skinId_ = SkinIdFromContent(data, std::move(files));
     const std::wstring text = DecodeIniText(data);
     return loadIni(text, error);
 }
@@ -932,6 +1168,7 @@ bool Theme::loadFromArchive(const std::wstring& file, std::wstring* error) {
         }
         return false;
     }
+    skinId_ = SkinIdFromBytes(zipBytes_);
     return loadIni(DecodeIniText(iniData), error);
 }
 
@@ -947,7 +1184,8 @@ bool Theme::loadIni(const std::wstring& text, std::wstring* error) {
 
     // Capture the skin's own font size before overrides are merged.  All
     // layout values in skin.ini are authored in this coordinate system; the
-    // renderer scales the finished plan by effectiveFontSize / baseFontSize.
+    // renderer measures text with Display::fontSize and scales the finished
+    // plan by Display::scalePercent (not by the font ratio).
     const auto baseDisplayIt = sections.find(L"display");
     baseFontSize_ = baseDisplayIt != sections.end()
                         ? std::max(1, GetInt(baseDisplayIt->second, L"font_size", 16))
@@ -973,8 +1211,17 @@ bool Theme::loadIni(const std::wstring& text, std::wstring* error) {
     }
 
     IniSectionMap overrides;
-    if (ReadOverrideSections(overridesPath_, &overrides) &&
-        !HasGlobalLayoutMarker(overrides)) {
+    const bool haveOverrides = ReadOverrideSections(overridesPath_, &overrides);
+    bool legacyFontOverride = false;
+    if (haveOverrides && !HasNewFontScaleSemantics(overrides)) {
+        const auto overrideDisplay = overrides.find(L"display");
+        legacyFontOverride =
+            overrideDisplay != overrides.end() &&
+            overrideDisplay->second.find(L"font_size") !=
+                overrideDisplay->second.end();
+    }
+    if (haveOverrides && !HasGlobalLayoutMarker(overrides) &&
+        !HasNewFontScaleSemantics(overrides)) {
         int overrideFontSize = baseFontSize_;
         const auto overrideDisplay = overrides.find(L"display");
         if (overrideDisplay != overrides.end()) {
@@ -1003,7 +1250,7 @@ bool Theme::loadIni(const std::wstring& text, std::wstring* error) {
     const auto displayIt = sections.find(L"display");
     if (displayIt != sections.end()) {
         const auto& section = displayIt->second;
-        display_.fontSize = GetInt(section, L"font_size", 16);
+        display_.fontSize = GetInt(section, L"font_size", baseFontSize_);
         const auto fontCh = GetString(section, L"font_ch");
         if (!fontCh.empty()) {
             display_.fontCh = fontCh;
@@ -1020,6 +1267,21 @@ bool Theme::loadIni(const std::wstring& text, std::wstring* error) {
         display_.useGdip = GetBool(section, L"use_gdip", true);
         display_.aero = GetBool(section, L"aero", false);
         display_.glow = GetBool(section, L"glow", false);
+    }
+    if (legacyFontOverride) {
+        // The old UI used font_size as "font size AND whole-window scale".
+        // Preserve the resulting window geometry by moving that ratio into
+        // the new scale field and keeping the skin's native text size.
+        display_.scalePercent =
+            ScalePercentFromLegacyFontSize(display_.fontSize, baseFontSize_);
+        display_.fontSize = std::max(1, baseFontSize_);
+    } else {
+        const int scalePercent =
+            displayIt != sections.end()
+                ? GetInt(displayIt->second, L"scale", 100)
+                : 100;
+        display_.scalePercent =
+            std::clamp(scalePercent, kMinScalePercent, kMaxScalePercent);
     }
 
     const auto renderIt = sections.find(L"render");
@@ -1153,7 +1415,8 @@ std::wstring BuildSettingsOverridesText(const Theme& baseTheme,
     ReadOverrideSections(existingPath, &sections);
 
     int removed = 0;
-    if (!HasGlobalLayoutMarker(sections)) {
+    if (!HasGlobalLayoutMarker(sections) &&
+        !HasNewFontScaleSemantics(sections)) {
         int oldFontSize = baseTheme.baseFontSize();
         const auto displayIt = sections.find(L"display");
         if (displayIt != sections.end()) {
@@ -1183,7 +1446,9 @@ std::wstring BuildSettingsOverridesText(const Theme& baseTheme,
     }
 
     auto& display = sections[L"display"];
-    display[L"font_size"] = std::to_wstring(values.fontSize);
+    display[L"font_size"] = std::to_wstring(std::max(1, values.fontSize));
+    display[L"scale"] = std::to_wstring(
+        std::clamp(values.scalePercent, kMinScalePercent, kMaxScalePercent));
     // Font faces are also UTF-16 in the INI (the settings UI writes the whole
     // file as UTF-16LE), so localized names such as 荆南麦圆体 round-trip
     // without loss.  An empty value leaves a hand-written override untouched.
@@ -1210,7 +1475,7 @@ std::wstring BuildSettingsOverridesText(const Theme& baseTheme,
     }
 
     auto& marker = sections[L"moqi_overrides"];
-    marker[L"version"] = L"2";
+    marker[L"version"] = L"3";
     marker[L"layout_mode"] = L"global";
 
     std::wostringstream out;
@@ -1308,10 +1573,9 @@ std::shared_ptr<Gdiplus::Bitmap> Theme::mask(const std::wstring& name) const {
 
 Renderer::Renderer(std::shared_ptr<Theme> theme, int dpi) : theme_(std::move(theme)), dpi_(dpi) {
     if (theme_) {
-        const int baseFont = std::max(1, theme_->baseFontSize());
-        const int effectiveFont = std::max(1, theme_->display().fontSize);
-        fontScale_ = std::clamp(static_cast<double>(effectiveFont) / baseFont,
-                                0.5, 4.0);
+        fontPixelSize_ = std::max(1, theme_->display().fontSize);
+        scalePercent_ = std::clamp(theme_->display().scalePercent,
+                                   kMinScalePercent, kMaxScalePercent);
     }
     updateScale();
 }
@@ -1320,7 +1584,7 @@ Renderer::~Renderer() = default;
 
 void Renderer::updateScale() const {
     const double dpiScale = static_cast<double>(dpi_ > 0 ? dpi_ : 96) / 96.0;
-    scale_ = fontScale_ * dpiScale;
+    scale_ = (static_cast<double>(scalePercent_) / 100.0) * dpiScale;
 }
 
 void Renderer::setDpi(int dpi) {
@@ -1379,8 +1643,7 @@ int Renderer::fontPixelSize() const {
     // Design-space font size.  The complete plan is scaled by scale_ at paint
     // time, so applying the monitor DPI here as well would double-scale text
     // while leaving skin bitmaps at 1x.
-    const int baseFont = theme_ ? std::max(1, theme_->baseFontSize()) : 16;
-    return baseFont;
+    return std::max(1, fontPixelSize_);
 }
 
 std::wstring Renderer::faceFor(bool ascii) const {
@@ -1683,6 +1946,12 @@ Renderer::Plan Renderer::buildPlan(HDC hdc, const RenderState& state) const {
     }
     const auto& render = theme_->render();
     const int fontPixel = fontPixelSize();
+    const int baseFont = theme_ ? std::max(1, theme_->baseFontSize()) : fontPixel;
+    // A larger configured font needs room for the glyphs, but the skin's
+    // 9-slice/margins must not be multiplied.  Only enlarge the affected
+    // dimension when the user actually exceeds the skin's native font size;
+    // the native-size path stays byte-identical to the historical output.
+    const bool enlargedFont = fontPixel > baseFont;
     const std::wstring preeditText =
         displayPreedit(state.preedit, render.pinyinSeparator);
     Gdiplus::Graphics measureGraphics(hdc);
@@ -1714,7 +1983,10 @@ Renderer::Plan Renderer::buildPlan(HDC hdc, const RenderState& state) const {
         const int zwBgW = zwBitmap ? static_cast<int>(zwBitmap->GetWidth()) : 0;
         const int zwBgH = zwBitmap ? static_cast<int>(zwBitmap->GetHeight()) : 0;
         const int pyW = std::max(pyBgW, preeditW + py[2] + py[3]);
-        const int pyH = std::max(1, pyBgH);
+        int pyH = std::max(1, pyBgH);
+        if (enlargedFont) {
+            pyH = std::max(pyH, py[0] + fontPixel + py[1]);
+        }
         const int rowH = rowHeight(fontPixel + kRowPadding);
         int zwW = 0;
         int zwH = std::max(1, zwBgH);
@@ -1726,6 +1998,9 @@ Renderer::Plan Renderer::buildPlan(HDC hdc, const RenderState& state) const {
         if (plan.horizontal) {
             // H2: candidates share the zhongwen slice's original height.
             zwW = std::max(zwBgW, rowW + zw[2] + zw[3] + kPageArrowArea);
+            if (enlargedFont) {
+                zwH = std::max(zwH, textTop + fontPixel + zw[1]);
+            }
         } else {
             // V2: one blank row height before the first candidate, exactly as
             // the Python reference (and official Sogou) lays out V1/V2.
@@ -1760,6 +2035,7 @@ Renderer::Plan Renderer::buildPlan(HDC hdc, const RenderState& state) const {
             plan.arrowY = plan.height - 8;
         }
         plan.arrowsHorizontal = plan.horizontal;
+        applyTextOffsets(&plan);
         return plan;
     }
 
@@ -1771,11 +2047,14 @@ Renderer::Plan Renderer::buildPlan(HDC hdc, const RenderState& state) const {
     if (state.candPerRow > 1) {
         plan.width = std::max(bgW, std::max(preeditW + py[2] + py[3],
                                              rowW + zw[2] + zw[3] + kPageArrowArea));
+        const int y = sepY + zw[0] - 1;
         plan.height = std::max(1, bgH);
+        if (enlargedFont) {
+            plan.height = std::max(plan.height, y + fontPixel + zw[1]);
+        }
         plan.primaryRect = {0, 0, plan.width, plan.height};
         plan.preeditRect = {py[2], py[0], py[2] + preeditW, py[0] + fontPixel};
         int x = zw[2];
-        const int y = sepY + zw[0] - 1;
         for (size_t i = 0; i < widths.size(); ++i) {
             RECT item = {x, y, x + widths[i], y + fontPixel};
             plan.candidateRects.push_back(item);
@@ -1807,7 +2086,29 @@ Renderer::Plan Renderer::buildPlan(HDC hdc, const RenderState& state) const {
         plan.arrowY = plan.height - 8;
         plan.arrowsHorizontal = false;
     }
+    applyTextOffsets(&plan);
     return plan;
+}
+
+void Renderer::applyTextOffsets(Plan* plan) const {
+    if (!plan || !theme_) {
+        return;
+    }
+    const SkinLayout& layout = theme_->layout();
+    if (layout.preeditX != 0 || layout.preeditY != 0) {
+        plan->preeditRect.left += layout.preeditX;
+        plan->preeditRect.right += layout.preeditX;
+        plan->preeditRect.top += layout.preeditY;
+        plan->preeditRect.bottom += layout.preeditY;
+    }
+    if (layout.candidateX != 0 || layout.candidateY != 0) {
+        for (RECT& rect : plan->candidateRects) {
+            rect.left += layout.candidateX;
+            rect.right += layout.candidateX;
+            rect.top += layout.candidateY;
+            rect.bottom += layout.candidateY;
+        }
+    }
 }
 
 LayoutResult Renderer::measure(const RenderState& state, HDC hdc) const {
