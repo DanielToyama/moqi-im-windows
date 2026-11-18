@@ -1583,22 +1583,34 @@ void TestSogouUModeDisplay() {
     Check(BuildSogouUModePreedit(L"ushui", L"ushui") == L"ushui",
           "ordinary pinyin that keeps the full u is not decorated");
 
-    // Enter on a u-mode gesture: only the consumed lookup prefix is removed.
-    // When the whole input is just `u` characters there is no lookup body, so
-    // the exact typed count must be committed (`u`, `uu`, `uuu`).
+    // Enter on a u-mode gesture commits the complete raw input.  Rime only
+    // strips the leading u from the composition preedit, never from the
+    // commit string, so ui/uxxx/u'shui must keep every typed character.
     using Moqi::ApplyUModeEnterCommit;
     Check(ApplyUModeEnterCommit(L"u", L"u") == L"u",
           "u-mode Enter commits a lone u");
     Check(ApplyUModeEnterCommit(L"uu", L"uu") == L"uu",
-          "u-mode Enter preserves a typed uu sequence");
+          "u-mode Enter commits a typed uu sequence");
     Check(ApplyUModeEnterCommit(L"uuu", L"uuu") == L"uuu",
-          "u-mode Enter preserves a typed uuu sequence");
+          "u-mode Enter commits a typed uuu sequence");
+    Check(ApplyUModeEnterCommit(L"ui", L"ui") == L"ui",
+          "u-mode Enter keeps u on a suffixed lookup");
+    Check(ApplyUModeEnterCommit(L"uxxx", L"uxxx") == L"uxxx",
+          "u-mode Enter keeps u on a long suffixed lookup");
+    Check(ApplyUModeEnterCommit(L"u'shui", L"u'shui") == L"u'shui",
+          "u-mode Enter keeps typed apostrophes and the leading u");
+    Check(ApplyUModeEnterCommit(L"ushui", L"ushui") == L"ushui",
+          "u-mode Enter commits ushui verbatim");
+    Check(ApplyUModeEnterCommit(L"uu", L"u") == L"uu",
+          "u-mode Enter restores a stripped uu prefix");
+    Check(ApplyUModeEnterCommit(L"ui", L"i") == L"ui",
+          "u-mode Enter restores u if a backend strips it");
+    Check(ApplyUModeEnterCommit(L"uxxx", L"xxx") == L"uxxx",
+          "u-mode Enter restores u for a stripped long lookup");
+    Check(ApplyUModeEnterCommit(L"u'shui", L"shui") == L"u'shui",
+          "u-mode Enter restores the complete raw lookup text");
     Check(ApplyUModeEnterCommit(L"u'", L"u") == L"u",
           "u-mode Enter keeps u when only separators follow it");
-    Check(ApplyUModeEnterCommit(L"u'shui", L"ushui") == L"shui",
-          "u-mode Enter strips the prefix from a lookup body");
-    Check(ApplyUModeEnterCommit(L"ushui", L"ushui") == L"shui",
-          "u-mode Enter handles commits without pretty separators");
     Check(ApplyUModeEnterCommit(L"us", L"𢌽") == L"𢌽",
           "u-mode Chinese candidate commits are untouched");
     Check(ApplyUModeEnterCommit(L"", L"u") == L"u",

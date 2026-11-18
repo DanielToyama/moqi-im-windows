@@ -644,7 +644,8 @@ bool Client::updateUModeTracker(Json::Value &msg, Ime::KeyEvent &keyEvent,
           : std::wstring();
   if (keyEvent.keyCode() == VK_RETURN && !uModeTracker_.rawInput().empty()) {
     // updateCommitString() runs inside updateStatus() below; remember the raw
-    // lookup input first so the Enter commit can drop the consumed u prefix.
+    // lookup input first so the Enter path can resolve the final commit with
+    // the complete typed text.
     uModeCommitRaw_ = uModeTracker_.rawInput();
   }
   uModeTracker_.onKeyEvent(static_cast<wchar_t>(keyEvent.charCode()),
@@ -774,11 +775,12 @@ void Client::updateCommitString(Json::Value &msg, Ime::EditSession *session,
     }
     const bool autoPairQuotesEnabled = textService_->autoPairQuotes();
     std::wstring commitString = rawCommitString;
-    // In u-mode, Enter is the "temporary English word" escape.  Rime commits
-    // the raw lookup input (e.g. ushui); strip only the leading u consumed by
-    // affix_segmentor and keep the rest of the typed word.  A lone `u` has no
-    // lookup body, so it is committed intact.  Chinese candidate commits do
-    // not match the raw tracked input and are left untouched.
+    // u-mode Enter must commit the complete raw input.  Rime only consumes the
+    // leading `u` from the composition preedit; its commit string already
+    // contains every typed key (`u`, `uu`, `ui`, `uxxx`, `u'shui`, ...).
+    // Do not strip the prefix here: the old temporary-English behavior broke
+    // every suffixed lookup.  Any future prefix stripping must be an explicit
+    // opt-in setting or shortcut.
     const std::wstring uModeRaw = uModeCommitRaw_;
     uModeCommitRaw_.clear();
     if (!uModeRaw.empty()) {

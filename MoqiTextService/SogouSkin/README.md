@@ -194,7 +194,7 @@ candidate_y=-15
 - 如果皮肤只有 H2/V2，则回退到分窗口绘制
 - **常驻状态栏窗口**：读取 `[StatusBar]` 的 `bar.png` / `bar_mask.png`，在屏幕右下角显示；没有输入/没有候选时也显示，可拖动，支持按钮悬停态和 `statusbar=0/1` 开关
 - **单一前台状态栏**：每个 TSF 宿主进程最多只显示一个状态栏；状态栏每 150ms 校验当前前台窗口是否属于本进程（含父/owner 链、宿主子窗口），切换应用后旧窗口立即隐藏，切回该应用时由 `onSetFocus`/`onActivate` 重新显示。新应用没有皮肤状态栏（UWP、部分 Electron/特殊 TSF 宿主）时宁可不显示，也不会残留上一个应用的窗口。前台窗口真正全屏时（`SogouSkinFullscreen.*`：DWM 可见边界 + `SHQueryUserNotificationState` + 窗口样式）状态栏以 400ms 低频 timer 保持隐藏，退出全屏后自动恢复；默认只隐藏全屏窗口覆盖的显示器，Windows 搜索、任务管理器最大化、自动隐藏任务栏下的最大化浏览器和桌面都不会误隐藏
-- **u 模式/拼字模式 preedit**：Rime `radical_lookup` 的 `prefix: u` 会在识别后吞掉组合串里的 `u`；前端跟踪空闲状态下以 `u` 开始的原始按键，在候选窗 preedit 显示 `u'...` 并追加 `[拼字]`（例如 `u'shui'shang[拼字]`）。只影响候选窗显示，不改变后端 composition/提交逻辑；按 Enter 仍沿用 Rime 的原始输入提交行为
+- **u 模式/拼字模式 preedit**：Rime `radical_lookup` 的 `prefix: u` 会在组合串显示中吞掉 `u`；前端跟踪空闲状态下以 `u` 开始的原始按键，在候选窗 preedit 显示 `u'...` 并追加 `[拼字]`（例如 `u'shui'shang[拼字]`）。u 模式只影响候选窗提示，不改变提交语义：按 Enter 原样提交完整原始输入并保留前导 `u`（例如 `ui`→`ui`、`uxxx`→`uxxx`、`u'shui`→`u'shui`），空格/数字选词及中文候选提交不受影响
 - **状态栏按钮状态**：`cn_en`/`quan_ban` 直接映射到后端 `switch-lang`/`switch-shape` 语言栏按钮，按 `chi.ico`/`eng.ico`、`full.ico`/`half.ico` 判断当前状态；快捷键 Shift、Shift+Space 切换后，状态栏图标会在 150ms 内跟随更新
 - **状态栏右键菜单**：右键状态栏可打开快捷菜单，包含中英文、全半角、中英标点、简繁、软键盘、**符号输入**（常用标点/数学符号/货币单位/特殊符号，通过 TSF 编辑会话插入），以及候选横排/竖排、状态栏显隐、皮肤设置、重新加载皮肤
 - **搜索框输入优化**：状态栏图标只在状态变化时重绘；按键抬起不再每次重建分层窗口。Windows 搜索/开始菜单仍然加载搜狗皮肤，不关闭皮肤渲染。

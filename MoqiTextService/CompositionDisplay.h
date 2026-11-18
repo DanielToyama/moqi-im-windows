@@ -93,6 +93,17 @@ private:
     std::wstring raw_;
 };
 
+// Resolves the text committed by Enter in a u-mode gesture.  Rime's
+// radical_lookup only removes the leading `u` from the *composition preedit*;
+// the commit string still contains every typed key, including `u` and any
+// apostrophes.  Ordinary Enter must therefore commit exactly what the user
+// typed (`u`, `uu`, `ui`, `uxxx`, `u'shui`, ...).
+//
+// The old "temporary English word drops the mode prefix" behavior was not
+// requested by the product and silently corrupted all u-mode commits with a
+// suffix.  Keep this resolver side-effect free: any future prefix-stripping
+// feature must be an explicit opt-in setting or shortcut, never the default
+// Enter path.
 // Normalizes commit/raw-input text for comparison: Rime may add pretty
 // syllable separators that the raw tracker never saw.
 inline std::wstring NormalizeUModeCommitText(const std::wstring& text) {
@@ -106,43 +117,25 @@ inline std::wstring NormalizeUModeCommitText(const std::wstring& text) {
     return result;
 }
 
-// Resolves the text committed by Enter in a u-mode gesture.  Rime commits the
-// raw lookup input including the leading `u` consumed by affix_segmentor, so
-// the prefix is stripped only when a lookup body exists.  If the input consists
-// only of `u` characters (`u`, `uu`, `uuu`), it is a literal temporary-English
-// commit and must be kept exactly as typed.
 inline std::wstring ApplyUModeEnterCommit(const std::wstring& rawInput,
                                           const std::wstring& commitString) {
-    if (rawInput.empty() || rawInput[0] != L'u' || commitString.empty() ||
-        commitString[0] != L'u') {
+    if (rawInput.empty() || commitString.empty()) {
         return commitString;
     }
+    // Rime normally returns the complete raw input (`ui`, `uxxx`, `u'shui`).
+    // If a backend path ever drops one or more leading u characters from the
+    // commit (the old bug), restore the exact typed raw text instead of
+    // silently committing a suffix.  A Chinese candidate commit is not a
+    // suffix of the raw lookup input and stays untouched.
     const std::wstring normalizedRaw = NormalizeUModeCommitText(rawInput);
-    bool onlyModePrefix = !normalizedRaw.empty();
-    for (wchar_t ch : normalizedRaw) {
-        if (ch != L'u' && ch != L'U') {
-            onlyModePrefix = false;
-            break;
-        }
+    const std::wstring normalizedCommit = NormalizeUModeCommitText(commitString);
+    if (normalizedRaw.size() > 1 &&
+        normalizedCommit.size() < normalizedRaw.size() &&
+        normalizedRaw.compare(normalizedRaw.size() - normalizedCommit.size(),
+                              normalizedCommit.size(), normalizedCommit) == 0) {
+        return rawInput;
     }
-    if (normalizedRaw.size() <= 1 || onlyModePrefix) {
-        // Only `u` characters were typed.  There is no lookup body to strip:
-        // Enter must commit exactly what the user typed (`u`, `uu`, `uuu`).
-        return commitString;
-    }
-    if (NormalizeUModeCommitText(commitString) != normalizedRaw) {
-        // Chinese candidate commits (and any other backend-side rewrites) do
-        // not match the tracked raw input and are left untouched.
-        return commitString;
-    }
-    std::wstring result = commitString;
-    result.erase(result.begin());
-    while (!result.empty() &&
-           (result.front() == L'\'' || result.front() == L' ' ||
-            result.front() == L'\t')) {
-        result.erase(result.begin());
-    }
-    return result;
+    return commitString;
 }
 
 // True when the candidate window must stay visible even without candidates.
