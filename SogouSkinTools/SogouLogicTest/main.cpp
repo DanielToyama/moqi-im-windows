@@ -177,6 +177,12 @@ std::wstring CreateTempAppDataRoot() {
     root += std::to_wstring(::GetCurrentProcessId());
     root += L"_";
     root += std::to_wstring(::GetTickCount64());
+    // GetTickCount64 has coarse resolution; tests can create/remove several
+    // isolated APPDATA roots within one tick on fast CI runners.  A static
+    // sequence keeps the directory name unique in that case.
+    static unsigned long sequence = 0;
+    root += L"_";
+    root += std::to_wstring(++sequence);
     if (!::CreateDirectoryW(root.c_str(), nullptr)) {
         return L"";
     }
