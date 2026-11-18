@@ -567,7 +567,10 @@ int TextService::sogouStatusBarItemState(const std::wstring& itemName) const {
 	}
 	if (!client_) {
 		const auto it = sogouStatusBarLocalStates_.find(itemName);
-		return it == sogouStatusBarLocalStates_.end() ? 0 : it->second;
+		const int state = it == sogouStatusBarLocalStates_.end() ? 0 : it->second;
+		// The skin's fan_jian images are ordered 简体, 繁体, while the
+		// local/toggled state is the opposite visual order.
+		return itemName == L"fan_jian" ? (state ? 0 : 1) : state;
 	}
 	LangBarButton* button = nullptr;
 	if (const wchar_t* backendId = BackendButtonIdForSogouItem(itemName)) {
@@ -580,7 +583,8 @@ int TextService::sogouStatusBarItemState(const std::wstring& itemName) const {
 	}
 	if (!button) {
 		const auto it = sogouStatusBarLocalStates_.find(itemName);
-		return it == sogouStatusBarLocalStates_.end() ? 0 : it->second;
+		const int state = it == sogouStatusBarLocalStates_.end() ? 0 : it->second;
+		return itemName == L"fan_jian" ? (state ? 0 : 1) : state;
 	}
 
 	const std::wstring icon = toLowerCopy(button->iconFile());
@@ -617,6 +621,9 @@ int TextService::sogouStatusBarItemState(const std::wstring& itemName) const {
 			return 1;
 		}
 		return button->toggled() ? 1 : 0;
+	}
+	if (itemName == L"fan_jian") {
+		return button->toggled() ? 0 : 1;
 	}
 	return button->toggled() ? 1 : 0;
 }
