@@ -2101,12 +2101,18 @@ void Renderer::applyTextOffsets(Plan* plan) const {
         plan->preeditRect.top += layout.preeditY;
         plan->preeditRect.bottom += layout.preeditY;
     }
-    if (layout.candidateX != 0 || layout.candidateY != 0) {
+    // Vertical skins need the candidate text 18 design pixels higher than
+    // the skin's raw layout.  Horizontal skins are unaffected; per-skin
+    // candidate nudges still apply on top of this baseline.
+    constexpr int kVerticalCandidateNudgeY = -18;
+    const int candidateYOffset =
+        layout.candidateY + (plan->horizontal ? 0 : kVerticalCandidateNudgeY);
+    if (layout.candidateX != 0 || candidateYOffset != 0) {
         for (RECT& rect : plan->candidateRects) {
             rect.left += layout.candidateX;
             rect.right += layout.candidateX;
-            rect.top += layout.candidateY;
-            rect.bottom += layout.candidateY;
+            rect.top += candidateYOffset;
+            rect.bottom += candidateYOffset;
         }
     }
 }
